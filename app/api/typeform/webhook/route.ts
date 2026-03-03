@@ -1,8 +1,11 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { findClient, createClient } from "@/lib/mindbody";
+import { neon } from "@neondatabase/serverless";
+import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
+
+const sql = neon(process.env.DATABASE_URL || "");
 
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
@@ -12,17 +15,14 @@ function timingSafeEqual(a: string, b: string) {
 }
 
 /**
- * Typeform signs webhook payloads using HMAC-SHA256 with the secret you set in Typeform UI.
- * Header is typically: "Typeform-Signature: sha256=..."
- *
- * We'll validate that. As a fallback, we also allow a simple header secret:
- * "typeform-secret: <secret>"
+ * Typeform Secret validation:
+ * Typeform sends "Typeform-Signature: sha256=<base64>"
+ * We compute base64(HMAC_SHA256(secret, rawBody)) and compare.
  */
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
 
-  // 1) Preferred: Typeform signature validation
   const sigHeader =
     req.headers.get("typeform-signature") ||
     req.headers.get("Typeform-Signature");
@@ -33,18 +33,14 @@ async function verifyTypeform(req: Request, rawBody: string) {
       .update(rawBody)
       .digest("base64");
 
-    // header can be "sha256=BASE64" or just "BASE64"
     const provided = sigHeader.startsWith("sha256=")
       ? sigHeader.slice("sha256=".length)
       : sigHeader;
 
-    if (!timingSafeEqual(provided, expected)) {
-      return { ok: false, mode: "signature" as const };
-    }
-    return { ok: true, mode: "signature" as const };
+    return { ok: timingSafeEqual(provided, expected), mode: "signature" as const };
   }
 
-  // 2) Fallback: simple secret header
+  // Optional fallback (only if you manually send a header secret)
   const headerSecret = req.headers.get("typeform-secret");
   if (headerSecret && headerSecret === secret) {
     return { ok: true, mode: "header" as const };
@@ -56,7 +52,6 @@ async function verifyTypeform(req: Request, rawBody: string) {
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
-
   const answers: any[] = payload?.form_response?.answers ?? [];
 
   const getByRef = (ref: string) => {
@@ -71,17 +66,42 @@ function extractLead(payload: any) {
   return {
     formId,
     token,
-    firstName: (getByRef("first_name") ?? "").toString(),
-    lastName: (getByRef("last_name") ?? "").toString(),
+    firstName: (getByRef("first_name") ?? "").toString().trim(),
+    lastName: (getByRef("last_name") ?? "").toString().trim(),
     email: getByRef("email"),
     phone: getByRef("phone")
   };
 }
 
+async function ensureTables() {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Missing DATABASE_URL. Connect Neon in Vercel to set it.");
+  }
+
+  await sql`
+    create table if not exists tenants (
+      id bigserial primary key,
+      form_id text not null unique,
+      location_name text,
+      site_id integer not null,
+      is_active boolean default true,
+      created_at timestamptz default now()
+    );
+  `;
+
+  await sql`
+    create table if not exists processed_submissions (
+      id bigserial primary key,
+      typeform_token text not null unique,
+      created_at timestamptz default now()
+    );
+  `;
+}
+
 export async function POST(req: Request) {
   const rawBody = await req.text();
 
-  // Verify Typeform webhook
+  // Verify webhook
   const verification = await verifyTypeform(req, rawBody);
   if (!verification.ok) {
     return NextResponse.json(
@@ -90,6 +110,7 @@ export async function POST(req: Request) {
     );
   }
 
+  // Parse JSON
   let payload: any;
   try {
     payload = JSON.parse(rawBody);
@@ -99,10 +120,15 @@ export async function POST(req: Request) {
 
   const lead = extractLead(payload);
   if (!lead.formId || !lead.token) {
-    return NextResponse.json({ ok: false, error: "Missing form_id or token" }, { status: 400 });
+    return NextResponse.json(
+      { ok: false, error: "Missing form_id or token" },
+      { status: 400 }
+    );
   }
 
-  // 1) Resolve tenant by form_id
+  await ensureTables();
+
+  // Tenant lookup
   const tenantRes = await sql`
     select form_id, location_name, site_id, is_active
     from tenants
@@ -110,7 +136,7 @@ export async function POST(req: Request) {
     limit 1
   `;
 
-  const tenant = tenantRes.rows?.[0] as any;
+  const tenant = (tenantRes as any)?.[0];
   if (!tenant || tenant.is_active === false) {
     return NextResponse.json({
       ok: true,
@@ -122,15 +148,7 @@ export async function POST(req: Request) {
 
   const siteId = Number(tenant.site_id);
 
-  // 2) Idempotency: prevent double-processing same Typeform token
-  await sql`
-    create table if not exists processed_submissions (
-      id bigserial primary key,
-      typeform_token text not null unique,
-      created_at timestamptz default now()
-    )
-  `;
-
+  // Idempotency: insert token, if duplicate then dedupe
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -145,7 +163,7 @@ export async function POST(req: Request) {
     });
   }
 
-  // 3) Find or create in Mindbody
+  // Mindbody sync
   try {
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
@@ -171,10 +189,7 @@ export async function POST(req: Request) {
     });
 
     if (!created?.Id) {
-      return NextResponse.json(
-        { ok: false, error: "Mindbody create failed" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
 
     return NextResponse.json({
@@ -189,11 +204,7 @@ export async function POST(req: Request) {
     const where = typeof err?.config?.url === "string" ? err.config.url : null;
 
     return NextResponse.json(
-      {
-        ok: false,
-        error: err?.message ?? "Server error",
-        mindbody: { status, where, data }
-      },
+      { ok: false, error: err?.message ?? "Server error", mindbody: { status, where, data } },
       { status: 500 }
     );
   }
