@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { sql } from "@vercel/postgres";
 import { findClient, createClient } from "@/lib/mindbody";
 
 export const runtime = "nodejs";
