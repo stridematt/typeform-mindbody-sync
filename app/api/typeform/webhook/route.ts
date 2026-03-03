@@ -14,11 +14,6 @@ function timingSafeEqual(a: string, b: string) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
-/**
- * Typeform Secret validation:
- * Typeform sends "Typeform-Signature: sha256=<base64>"
- * We compute base64(HMAC_SHA256(secret, rawBody)) and compare.
- */
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
@@ -37,22 +32,35 @@ async function verifyTypeform(req: Request, rawBody: string) {
       ? sigHeader.slice("sha256=".length)
       : sigHeader;
 
-    return { ok: timingSafeEqual(provided, expected), mode: "signature" as const };
+    return { ok: timingSafeEqual(provided, expected) };
   }
 
-  // Optional fallback (only if you manually send a header secret)
   const headerSecret = req.headers.get("typeform-secret");
-  if (headerSecret && headerSecret === secret) {
-    return { ok: true, mode: "header" as const };
-  }
+  if (headerSecret && headerSecret === secret) return { ok: true };
 
-  return { ok: false, mode: "none" as const };
+  return { ok: false };
+}
+
+function normalize(s: string) {
+  return s.toLowerCase().trim();
 }
 
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
   const answers: any[] = payload?.form_response?.answers ?? [];
+  const fields: any[] = payload?.form_response?.definition?.fields ?? [];
+
+  const fieldById = new Map<string, any>();
+  for (const f of fields) {
+    if (f?.id) fieldById.set(f.id, f);
+  }
+
+  const getTitle = (answer: any) => {
+    const fieldId = answer?.field?.id;
+    const field = fieldId ? fieldById.get(fieldId) : null;
+    return (field?.title ?? "").toString();
+  };
 
   const getByRef = (ref: string) => {
     const a = answers.find((x) => x?.field?.ref === ref);
@@ -63,13 +71,42 @@ function extractLead(payload: any) {
     return null;
   };
 
+  // Strong: refs (if you set them)
+  let firstName = (getByRef("first_name") ?? "").toString().trim();
+  let lastName = (getByRef("last_name") ?? "").toString().trim();
+  let email = getByRef("email");
+  let phone = getByRef("phone");
+
+  // Fallback: detect by field title for name fields
+  if (!firstName) {
+    const a = answers.find((x) => normalize(getTitle(x)).includes("first name"));
+    if (a?.type === "text") firstName = (a.text ?? "").toString().trim();
+  }
+
+  if (!lastName) {
+    const a = answers.find((x) => normalize(getTitle(x)).includes("last name"));
+    if (a?.type === "text") lastName = (a.text ?? "").toString().trim();
+  }
+
+  // Fallback: detect by answer type for email/phone
+  if (!email) {
+    const a = answers.find((x) => x?.type === "email");
+    email = a?.email ?? null;
+  }
+
+  if (!phone) {
+    const a = answers.find((x) => x?.type === "phone_number");
+    phone = a?.phone_number ?? null;
+  }
+
   return {
     formId,
     token,
-    firstName: (getByRef("first_name") ?? "").toString().trim(),
-    lastName: (getByRef("last_name") ?? "").toString().trim(),
-    email: getByRef("email"),
-    phone: getByRef("phone")
+    firstName,
+    lastName,
+    email,
+    phone,
+    answersCount: answers.length
   };
 }
 
@@ -101,7 +138,6 @@ async function ensureTables() {
 export async function POST(req: Request) {
   const rawBody = await req.text();
 
-  // Verify webhook
   const verification = await verifyTypeform(req, rawBody);
   if (!verification.ok) {
     return NextResponse.json(
@@ -110,7 +146,6 @@ export async function POST(req: Request) {
     );
   }
 
-  // Parse JSON
   let payload: any;
   try {
     payload = JSON.parse(rawBody);
@@ -119,16 +154,33 @@ export async function POST(req: Request) {
   }
 
   const lead = extractLead(payload);
-  if (!lead.formId || !lead.token) {
-    return NextResponse.json(
-      { ok: false, error: "Missing form_id or token" },
-      { status: 400 }
-    );
+
+  if (!lead.formId || !lead.token || lead.answersCount === 0) {
+    return NextResponse.json({
+      ok: true,
+      status: "typeform_test_ok",
+      message: "Webhook verified. Submit a real response to create a client."
+    });
+  }
+
+  // If names are still missing, return a clear 200 with diagnostics
+  if (!lead.firstName || !lead.lastName) {
+    return NextResponse.json({
+      ok: true,
+      status: "missing_name_fields",
+      extracted: {
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        email: lead.email,
+        phone: lead.phone
+      },
+      message:
+        "First/Last name could not be extracted. Set Typeform field refs to first_name and last_name (recommended)."
+    });
   }
 
   await ensureTables();
 
-  // Tenant lookup
   const tenantRes = await sql`
     select form_id, location_name, site_id, is_active
     from tenants
@@ -148,7 +200,6 @@ export async function POST(req: Request) {
 
   const siteId = Number(tenant.site_id);
 
-  // Idempotency: insert token, if duplicate then dedupe
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -163,7 +214,6 @@ export async function POST(req: Request) {
     });
   }
 
-  // Mindbody sync
   try {
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
