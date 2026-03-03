@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getTenantByFormId, getIdempotency, insertIdempotency } from "@/lib/db";
+import { getTenantByFormId, getIdempotency, insertIdempotency } from "../../../../lib/db";
 
 export const runtime = "nodejs";
 
