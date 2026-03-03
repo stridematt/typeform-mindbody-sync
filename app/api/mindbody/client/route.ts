@@ -5,6 +5,7 @@ const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
 
 export const runtime = "nodejs";
 
+// Token cache per SiteId
 const tokenCache = new Map<number, { token: string; expiresAt: number }>();
 
 function baseHeaders(siteId: number) {
@@ -52,22 +53,27 @@ export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
     const siteId = Number(searchParams.get("siteId"));
-    const clientId = searchParams.get("clientId");
+    const searchText = searchParams.get("searchText");
 
-    if (!siteId || !clientId) {
+    if (!siteId || !searchText) {
       return NextResponse.json(
-        { ok: false, error: "Missing siteId or clientId" },
+        { ok: false, error: "Missing siteId or searchText" },
         { status: 400 }
       );
     }
 
-    const resp = await axios.get(`${MINDBODY_BASE_URL}/client/client`, {
+    const resp = await axios.get(`${MINDBODY_BASE_URL}/client/clients`, {
       headers: await authHeaders(siteId),
-      params: { ClientId: clientId },
+      params: { SearchText: searchText, Limit: 5, Offset: 0 },
       timeout: 15000
     });
 
-    return NextResponse.json({ ok: true, client: resp.data });
+    return NextResponse.json({
+      ok: true,
+      siteId,
+      searchText,
+      clients: resp.data?.Clients ?? []
+    });
   } catch (err: any) {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
