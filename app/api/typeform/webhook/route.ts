@@ -7,6 +7,9 @@ export const runtime = "nodejs";
 
 const sql = neon(process.env.DATABASE_URL || "");
 
+const FALLBACK_PHONE = "5555555555";
+const FALLBACK_EMAIL = "pending@strideautomation.com";
+
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
@@ -62,48 +65,38 @@ function extractLead(payload: any) {
     return (field?.title ?? "").toString();
   };
 
-  const getByRef = (ref: string) => {
-    const a = answers.find((x) => x?.field?.ref === ref);
-    if (!a) return null;
-    if (a.type === "text") return a.text ?? null;
-    if (a.type === "email") return a.email ?? null;
-    if (a.type === "phone_number") return a.phone_number ?? null;
-    return null;
-  };
+  let firstName = "";
+  let lastName = "";
+  let email: string | null = null;
+  let phone: string | null = null;
 
-  // Strong: refs (if you set them)
-  let firstName = (getByRef("first_name") ?? "").toString().trim();
-  let lastName = (getByRef("last_name") ?? "").toString().trim();
-  let email = getByRef("email");
-  let phone = getByRef("phone");
+  for (const answer of answers) {
+    const title = normalize(getTitle(answer));
 
-  // Fallback: detect by field title for name fields
-  if (!firstName) {
-    const a = answers.find((x) => normalize(getTitle(x)).includes("first name"));
-    if (a?.type === "text") firstName = (a.text ?? "").toString().trim();
-  }
+    if (answer.type === "email") {
+      email = answer.email ?? null;
+    }
 
-  if (!lastName) {
-    const a = answers.find((x) => normalize(getTitle(x)).includes("last name"));
-    if (a?.type === "text") lastName = (a.text ?? "").toString().trim();
-  }
+    if (answer.type === "phone_number") {
+      phone = answer.phone_number ?? null;
+    }
 
-  // Fallback: detect by answer type for email/phone
-  if (!email) {
-    const a = answers.find((x) => x?.type === "email");
-    email = a?.email ?? null;
-  }
+    if (answer.type === "text") {
+      if (!firstName && title.includes("first name")) {
+        firstName = answer.text ?? "";
+      }
 
-  if (!phone) {
-    const a = answers.find((x) => x?.type === "phone_number");
-    phone = a?.phone_number ?? null;
+      if (!lastName && title.includes("last name")) {
+        lastName = answer.text ?? "";
+      }
+    }
   }
 
   return {
     formId,
     token,
-    firstName,
-    lastName,
+    firstName: firstName.trim(),
+    lastName: lastName.trim(),
     email,
     phone,
     answersCount: answers.length
@@ -112,7 +105,7 @@ function extractLead(payload: any) {
 
 async function ensureTables() {
   if (!process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL. Connect Neon in Vercel to set it.");
+    throw new Error("Missing DATABASE_URL.");
   }
 
   await sql`
@@ -158,24 +151,14 @@ export async function POST(req: Request) {
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
     return NextResponse.json({
       ok: true,
-      status: "typeform_test_ok",
-      message: "Webhook verified. Submit a real response to create a client."
+      status: "typeform_test_ok"
     });
   }
 
-  // If names are still missing, return a clear 200 with diagnostics
   if (!lead.firstName || !lead.lastName) {
     return NextResponse.json({
-      ok: true,
-      status: "missing_name_fields",
-      extracted: {
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        email: lead.email,
-        phone: lead.phone
-      },
-      message:
-        "First/Last name could not be extracted. Set Typeform field refs to first_name and last_name (recommended)."
+      ok: false,
+      error: "FirstName and LastName required in Typeform"
     });
   }
 
@@ -193,8 +176,7 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true,
       status: "routed",
-      routedTo: null,
-      message: "No active tenant for this form_id"
+      routedTo: null
     });
   }
 
@@ -208,18 +190,29 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({
       ok: true,
-      status: "routed",
-      deduped: true,
+      status: "deduped",
       routedTo: { locationName: tenant.location_name, siteId }
     });
   }
+
+  // 🔥 NORMALIZATION SECTION (your requested logic)
+
+  const normalizedEmail =
+    lead.email && lead.email.trim().length > 0
+      ? lead.email.trim()
+      : FALLBACK_EMAIL;
+
+  const normalizedPhone =
+    lead.phone && lead.phone.trim().length > 0
+      ? lead.phone.replace(/\D/g, "")
+      : FALLBACK_PHONE;
 
   try {
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
-      email: lead.email,
-      phone: lead.phone
+      email: normalizedEmail,
+      phone: normalizedPhone
     });
 
     if (existing?.Id) {
@@ -234,12 +227,15 @@ export async function POST(req: Request) {
     const created = await createClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
-      email: lead.email,
-      phone: lead.phone
+      email: normalizedEmail,
+      phone: normalizedPhone
     });
 
     if (!created?.Id) {
-      return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Mindbody create failed" },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
@@ -249,12 +245,16 @@ export async function POST(req: Request) {
       routedTo: { locationName: tenant.location_name, siteId }
     });
   } catch (err: any) {
-    const status = err?.response?.status ?? null;
-    const data = err?.response?.data ?? null;
-    const where = typeof err?.config?.url === "string" ? err.config.url : null;
-
     return NextResponse.json(
-      { ok: false, error: err?.message ?? "Server error", mindbody: { status, where, data } },
+      {
+        ok: false,
+        error: err?.message ?? "Server error",
+        mindbody: {
+          status: err?.response?.status ?? null,
+          where: err?.config?.url ?? null,
+          data: err?.response?.data ?? null
+        }
+      },
       { status: 500 }
     );
   }
