@@ -2,11 +2,8 @@ import axios from "axios";
 
 const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
 
-// IMPORTANT: issue the user token once against your primary corporate site.
-// Using Carmel Mountain Ranch as primary (works for your org based on prior test).
-const PRIMARY_SITE_ID = 5749851;
-
-let cachedToken: { token: string; expiresAt: number } | null = null;
+// Cache tokens per siteId (required by Mindbody)
+const tokenCache = new Map<number, { token: string; expiresAt: number }>();
 
 function baseHeaders(siteId: number) {
   const apiKey = process.env.MINDBODY_API_KEY;
@@ -19,7 +16,7 @@ function baseHeaders(siteId: number) {
   };
 }
 
-async function getUserToken() {
+async function getUserToken(siteId: number) {
   const username = process.env.MINDBODY_USERNAME;
   const password = process.env.MINDBODY_PASSWORD;
 
@@ -28,24 +25,25 @@ async function getUserToken() {
   }
 
   const now = Date.now();
-  if (cachedToken && cachedToken.expiresAt > now) return cachedToken.token;
+  const cached = tokenCache.get(siteId);
+  if (cached && cached.expiresAt > now) return cached.token;
 
   const resp = await axios.post(
     `${MINDBODY_BASE_URL}/usertoken/issue`,
     { Username: username, Password: password },
-    { headers: baseHeaders(PRIMARY_SITE_ID), timeout: 15000 }
+    { headers: baseHeaders(siteId), timeout: 15000 }
   );
 
   const token = resp.data?.AccessToken;
   if (!token) throw new Error("Mindbody usertoken/issue returned no AccessToken");
 
-  // cache for 45 minutes to be safe
-  cachedToken = { token, expiresAt: now + 45 * 60 * 1000 };
+  // Cache ~45 minutes
+  tokenCache.set(siteId, { token, expiresAt: now + 45 * 60 * 1000 });
   return token;
 }
 
 async function authHeaders(siteId: number) {
-  const token = await getUserToken();
+  const token = await getUserToken(siteId);
   return {
     ...baseHeaders(siteId),
     Authorization: `Bearer ${token}`
@@ -82,7 +80,6 @@ export async function findClient(siteId: number, lead: Lead) {
   return resp.data?.Clients?.[0] ?? null;
 }
 
-// Correct v6 endpoint for creating a client
 export async function createClient(siteId: number, lead: Lead) {
   const resp = await axios.post(
     `${MINDBODY_BASE_URL}/client/addclient`,
@@ -98,6 +95,5 @@ export async function createClient(siteId: number, lead: Lead) {
     }
   );
 
-  // Mindbody returns the created client object
   return resp.data ?? null;
 }
