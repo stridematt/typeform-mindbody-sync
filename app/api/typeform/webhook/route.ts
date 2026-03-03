@@ -162,9 +162,27 @@ export async function POST(req: Request) {
       }
     });
   } catch (err: any) {
-    console.error("Webhook error:", err);
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+    const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
+    console.error("Webhook error:", {
+      message: err?.message,
+      status,
+      where,
+      data
+    });
+
     return NextResponse.json(
-      { ok: false, error: err?.message ?? "Server error" },
+      {
+        ok: false,
+        error: err?.message ?? "Server error",
+        mindbody: {
+          status,
+          where,
+          data
+        }
+      },
       { status: 500 }
     );
   }
