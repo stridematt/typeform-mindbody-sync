@@ -7,8 +7,11 @@ export const runtime = "nodejs";
 
 const sql = neon(process.env.DATABASE_URL || "");
 
-const FALLBACK_PHONE = "5555555555";
-const FALLBACK_EMAIL = "pending@strideautomation.com";
+// Used only as a domain for placeholder emails
+const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
+
+// Used only as a prefix for placeholder phones
+const FALLBACK_PHONE_PREFIX = "555";
 
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
@@ -48,9 +51,30 @@ function normalize(s: string) {
   return s.toLowerCase().trim();
 }
 
+/**
+ * Create a stable 10-digit dummy phone number from a seed (Typeform token).
+ * Format: 555XXXXXXX where XXXXXXX are digits derived from a hash.
+ */
+function makeDummyPhone(seed: string) {
+  const hex = crypto.createHash("sha256").update(seed).digest("hex");
+  const digits = hex.replace(/\D/g, "").padEnd(20, "0"); // ensure enough digits
+  const last7 = digits.slice(-7);
+  return `${FALLBACK_PHONE_PREFIX}${last7}`; // total 10 digits
+}
+
+/**
+ * Create a stable dummy email from a seed (Typeform token).
+ * Example: pending+<short>@strideautomation.com
+ */
+function makeDummyEmail(seed: string) {
+  const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
+  return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
+}
+
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
+
   const answers: any[] = payload?.form_response?.answers ?? [];
   const fields: any[] = payload?.form_response?.definition?.fields ?? [];
 
@@ -82,13 +106,8 @@ function extractLead(payload: any) {
     }
 
     if (answer.type === "text") {
-      if (!firstName && title.includes("first name")) {
-        firstName = answer.text ?? "";
-      }
-
-      if (!lastName && title.includes("last name")) {
-        lastName = answer.text ?? "";
-      }
+      if (!firstName && title.includes("first name")) firstName = answer.text ?? "";
+      if (!lastName && title.includes("last name")) lastName = answer.text ?? "";
     }
   }
 
@@ -104,9 +123,7 @@ function extractLead(payload: any) {
 }
 
 async function ensureTables() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL.");
-  }
+  if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL.");
 
   await sql`
     create table if not exists tenants (
@@ -148,22 +165,21 @@ export async function POST(req: Request) {
 
   const lead = extractLead(payload);
 
+  // Typeform "test" pings can be empty
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
-    return NextResponse.json({
-      ok: true,
-      status: "typeform_test_ok"
-    });
+    return NextResponse.json({ ok: true, status: "typeform_test_ok" });
   }
 
   if (!lead.firstName || !lead.lastName) {
-    return NextResponse.json({
-      ok: false,
-      error: "FirstName and LastName required in Typeform"
-    });
+    return NextResponse.json(
+      { ok: false, error: "FirstName and LastName required in Typeform" },
+      { status: 400 }
+    );
   }
 
   await ensureTables();
 
+  // Resolve tenant by form_id
   const tenantRes = await sql`
     select form_id, location_name, site_id, is_active
     from tenants
@@ -173,15 +189,12 @@ export async function POST(req: Request) {
 
   const tenant = (tenantRes as any)?.[0];
   if (!tenant || tenant.is_active === false) {
-    return NextResponse.json({
-      ok: true,
-      status: "routed",
-      routedTo: null
-    });
+    return NextResponse.json({ ok: true, status: "routed", routedTo: null });
   }
 
   const siteId = Number(tenant.site_id);
 
+  // Idempotency: prevent double-processing same token
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -195,17 +208,14 @@ export async function POST(req: Request) {
     });
   }
 
-  // 🔥 NORMALIZATION SECTION (your requested logic)
-
+  // ✅ Unique fallbacks (no collisions)
   const normalizedEmail =
-    lead.email && lead.email.trim().length > 0
-      ? lead.email.trim()
-      : FALLBACK_EMAIL;
+    lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
 
-  const normalizedPhone =
-    lead.phone && lead.phone.trim().length > 0
-      ? lead.phone.replace(/\D/g, "")
-      : FALLBACK_PHONE;
+  const normalizedPhoneRaw =
+    lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
+
+  const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
 
   try {
     const existing = await findClient(siteId, {
@@ -232,17 +242,18 @@ export async function POST(req: Request) {
     });
 
     if (!created?.Id) {
-      return NextResponse.json(
-        { ok: false, error: "Mindbody create failed" },
-        { status: 500 }
-      );
+      return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
 
     return NextResponse.json({
       ok: true,
       status: "created",
       mbClientId: String(created.Id),
-      routedTo: { locationName: tenant.location_name, siteId }
+      routedTo: { locationName: tenant.location_name, siteId },
+      fallbacksUsed: {
+        emailWasFallback: !lead.email,
+        phoneWasFallback: !lead.phone
+      }
     });
   } catch (err: any) {
     return NextResponse.json(
