@@ -1,114 +1,171 @@
-import axios from "axios";
+import { NextResponse } from "next/server";
+import {
+  getTenantByFormId,
+  getIdempotency,
+  insertIdempotency
+} from "../../../../lib/db";
+import { findClient, createClient, type Lead } from "../../../../lib/mindbody";
 
-const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
+export const runtime = "nodejs";
 
-// simple in-memory token cache (works great on warm serverless instances)
-let cachedToken: { token: string; expiresAt: number; siteId: number } | null = null;
+function verifyTypeformSecret(req: Request) {
+  const incoming = req.headers.get("typeform-secret");
+  const expected = process.env.TYPEFORM_WEBHOOK_SECRET;
 
-function baseHeaders(siteId: number) {
-  const apiKey = process.env.MINDBODY_API_KEY;
-  if (!apiKey) throw new Error("Missing MINDBODY_API_KEY env var");
+  if (!expected) throw new Error("TYPEFORM_WEBHOOK_SECRET not set");
+  return incoming === expected;
+}
+
+function extractLead(payload: any): Lead {
+  const answers: any[] = payload?.form_response?.answers ?? [];
+
+  const byRef = (ref: string) => answers.find(a => a?.field?.ref === ref);
+
+  const first =
+    byRef("first_name")?.text ??
+    byRef("firstname")?.text ??
+    byRef("first")?.text ??
+    "";
+
+  const last =
+    byRef("last_name")?.text ??
+    byRef("lastname")?.text ??
+    byRef("last")?.text ??
+    "";
+
+  const email =
+    byRef("email")?.email ??
+    answers.find(a => a?.type === "email")?.email ??
+    null;
+
+  const phone =
+    byRef("phone")?.phone_number ??
+    byRef("phone_number")?.phone_number ??
+    answers.find(a => a?.type === "phone_number")?.phone_number ??
+    null;
 
   return {
-    "Api-Key": apiKey,
-    "SiteId": String(siteId),
-    "Content-Type": "application/json"
+    firstName: String(first).trim(),
+    lastName: String(last).trim(),
+    email,
+    phone
   };
 }
 
-async function getUserToken(siteId: number) {
-  const username = process.env.MINDBODY_USERNAME;
-  const password = process.env.MINDBODY_PASSWORD;
+export async function POST(req: Request) {
+  try {
+    if (!verifyTypeformSecret(req)) {
+      return new NextResponse("Unauthorized", { status: 401 });
+    }
 
-  if (!username || !password) {
-    throw new Error("Missing MINDBODY_USERNAME or MINDBODY_PASSWORD env vars");
-  }
+    const payload = await req.json();
 
-  // reuse cached token for the same site if still valid
-  const now = Date.now();
-  if (cachedToken && cachedToken.siteId === siteId && cachedToken.expiresAt > now) {
-    return cachedToken.token;
-  }
+    const formId = payload?.form_response?.form_id;
+    const responseId = payload?.form_response?.token;
 
-  const url = `${MINDBODY_BASE_URL}/usertoken/issue`;
+    if (!formId || !responseId) {
+      return NextResponse.json(
+        { ok: false, error: "Missing form_id or response token" },
+        { status: 400 }
+      );
+    }
 
-  const resp = await axios.post(
-    url,
-    { Username: username, Password: password },
-    { headers: baseHeaders(siteId), timeout: 15000 }
-  );
+    const already = await getIdempotency(responseId);
+    if (already) {
+      return NextResponse.json({
+        ok: true,
+        status: already.status,
+        mbClientId: already.mb_client_id ?? null,
+        deduped: true
+      });
+    }
 
-  const token = resp.data?.AccessToken;
-  if (!token) throw new Error("Mindbody usertoken/issue returned no AccessToken");
+    const tenant = await getTenantByFormId(formId);
+    if (!tenant) {
+      await insertIdempotency({
+        responseId,
+        formId,
+        status: "failed",
+        error: "Unknown or inactive form_id"
+      });
+      return NextResponse.json(
+        { ok: false, error: "Unknown or inactive form_id" },
+        { status: 400 }
+      );
+    }
 
-  // Mindbody tokens typically last a while; cache for 45 minutes to be safe
-  cachedToken = { token, siteId, expiresAt: now + 45 * 60 * 1000 };
-  return token;
-}
+    const lead = extractLead(payload);
 
-function normalizeEmail(email?: string | null) {
-  if (!email) return null;
-  return email.trim().toLowerCase();
-}
+    if (!lead.firstName || !lead.lastName) {
+      await insertIdempotency({
+        responseId,
+        formId,
+        status: "failed",
+        error: "Missing first and/or last name in Typeform payload"
+      });
+      return NextResponse.json(
+        { ok: false, error: "Missing first and/or last name" },
+        { status: 400 }
+      );
+    }
 
-function normalizePhone(phone?: string | null) {
-  if (!phone) return null;
-  return phone.replace(/[^\d]/g, "");
-}
+    const existing = await findClient(Number(tenant.site_id), lead);
 
-export type Lead = {
-  firstName: string;
-  lastName: string;
-  email?: string | null;
-  phone?: string | null;
-};
+    if (existing?.Id) {
+      await insertIdempotency({
+        responseId,
+        formId,
+        status: "exists",
+        mbClientId: String(existing.Id)
+      });
 
-async function authHeaders(siteId: number) {
-  const token = await getUserToken(siteId);
-  return {
-    ...baseHeaders(siteId),
-    Authorization: `Bearer ${token}`
-  };
-}
+      return NextResponse.json({
+        ok: true,
+        status: "exists",
+        mbClientId: String(existing.Id),
+        routedTo: {
+          locationName: tenant.location_name ?? null,
+          siteId: tenant.site_id
+        }
+      });
+    }
 
-export async function findClient(siteId: number, lead: Lead) {
-  const phone = normalizePhone(lead.phone);
-  const email = normalizeEmail(lead.email);
-  const searchText = phone || email;
-  if (!searchText) return null;
+    const created = await createClient(Number(tenant.site_id), lead);
 
-  const url = `${MINDBODY_BASE_URL}/client/clients`;
+    if (!created?.Id) {
+      await insertIdempotency({
+        responseId,
+        formId,
+        status: "failed",
+        error: "Mindbody create returned no client Id"
+      });
+      return NextResponse.json(
+        { ok: false, error: "Mindbody create failed" },
+        { status: 502 }
+      );
+    }
 
-  const resp = await axios.get(url, {
-    headers: await authHeaders(siteId),
-    params: { SearchText: searchText, Limit: 1, Offset: 0 },
-    timeout: 15000
-  });
+    await insertIdempotency({
+      responseId,
+      formId,
+      status: "created",
+      mbClientId: String(created.Id)
+    });
 
-  const clients = resp.data?.Clients ?? [];
-  return clients[0] ?? null;
-}
-
-export async function createClient(siteId: number, lead: Lead) {
-  const url = `${MINDBODY_BASE_URL}/client/addorupdateclients`;
-
-  const payload = {
-    Test: false,
-    Clients: [
-      {
-        FirstName: lead.firstName.trim(),
-        LastName: lead.lastName.trim(),
-        Email: normalizeEmail(lead.email),
-        MobilePhone: normalizePhone(lead.phone)
+    return NextResponse.json({
+      ok: true,
+      status: "created",
+      mbClientId: String(created.Id),
+      routedTo: {
+        locationName: tenant.location_name ?? null,
+        siteId: tenant.site_id
       }
-    ]
-  };
-
-  const resp = await axios.post(url, payload, {
-    headers: await authHeaders(siteId),
-    timeout: 15000
-  });
-
-  const clients = resp.data?.Clients ?? [];
-  return clients[0] ?? null;
+    });
+  } catch (err: any) {
+    console.error("Webhook error:", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message ?? "Server error" },
+      { status: 500 }
+    );
+  }
 }
