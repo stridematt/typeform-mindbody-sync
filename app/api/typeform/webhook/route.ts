@@ -1,17 +1,18 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { neon } from "@neondatabase/serverless";
-import { findClient, createClient } from "../../../../lib/mindbody";
+import { sql } from "@neondatabase/serverless";
+import { findClient, createClient } from "@/lib/mindbody";
 
 export const runtime = "nodejs";
 
-const sql = neon(process.env.DATABASE_URL || "");
+/** constant "pending" domain you wanted */
+const PENDING_EMAIL_DOMAIN = "strideautomation.com";
 
-// Used only as a domain for placeholder emails
-const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
-
-// Used only as a prefix for placeholder phones
-const FALLBACK_PHONE_PREFIX = "555";
+/** Normalize phone to digits only; Mindbody is pretty tolerant if you send digits */
+function normalizePhone(raw: string | null | undefined) {
+  if (!raw) return "";
+  return raw.replace(/\D/g, "");
+}
 
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
@@ -20,6 +21,10 @@ function timingSafeEqual(a: string, b: string) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
+/**
+ * Typeform signs webhook payloads using HMAC-SHA256 with the secret you set in Typeform UI.
+ * Header: Typeform-Signature: sha256=BASE64
+ */
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
@@ -38,39 +43,55 @@ async function verifyTypeform(req: Request, rawBody: string) {
       ? sigHeader.slice("sha256=".length)
       : sigHeader;
 
-    return { ok: timingSafeEqual(provided, expected) };
+    if (!timingSafeEqual(provided, expected)) {
+      return { ok: false, mode: "signature" as const };
+    }
+    return { ok: true, mode: "signature" as const };
   }
 
+  // Optional fallback: simple secret header (handy for Postman)
   const headerSecret = req.headers.get("typeform-secret");
-  if (headerSecret && headerSecret === secret) return { ok: true };
+  if (headerSecret && headerSecret === secret) {
+    return { ok: true, mode: "header" as const };
+  }
 
-  return { ok: false };
+  return { ok: false, mode: "none" as const };
 }
 
-function normalize(s: string) {
-  return s.toLowerCase().trim();
+function sha1(input: string) {
+  return crypto.createHash("sha1").update(input).digest("hex");
 }
 
 /**
- * Create a stable 10-digit dummy phone number from a seed (Typeform token).
- * Format: 555XXXXXXX where XXXXXXX are digits derived from a hash.
+ * Generate a unique fallback email per submission so we never collide.
+ * ex: pending+ab12cd34@strideautomation.com
  */
-function makeDummyPhone(seed: string) {
-  const hex = crypto.createHash("sha256").update(seed).digest("hex");
-  const digits = hex.replace(/\D/g, "").padEnd(20, "0"); // ensure enough digits
+function makeFallbackEmail(token: string) {
+  const short = sha1(token).slice(0, 8);
+  return `pending+${short}@${PENDING_EMAIL_DOMAIN}`;
+}
+
+/**
+ * Generate a unique fallback phone per submission so we never collide.
+ * We'll generate a US-looking 10-digit number in the safe 555 range:
+ * 555 + 7 digits from token hash
+ * ex: 5551234567
+ */
+function makeFallbackPhone(token: string) {
+  const digits = sha1(token)
+    .replace(/[a-f]/g, "") // strip hex letters
+    .padEnd(12, "0"); // ensure enough digits
   const last7 = digits.slice(-7);
-  return `${FALLBACK_PHONE_PREFIX}${last7}`; // total 10 digits
+  return `555${last7}`; // 10 digits total
 }
 
 /**
- * Create a stable dummy email from a seed (Typeform token).
- * Example: pending+<short>@strideautomation.com
+ * Robust extraction:
+ * - Works if you used `field.ref` (best)
+ * - Also works for Contact Info blocks by:
+ *   - looking at answer.type (email / phone_number / text)
+ *   - mapping by field title in definition (First name/Last name/etc)
  */
-function makeDummyEmail(seed: string) {
-  const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
-  return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
-}
-
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
@@ -78,76 +99,79 @@ function extractLead(payload: any) {
   const answers: any[] = payload?.form_response?.answers ?? [];
   const fields: any[] = payload?.form_response?.definition?.fields ?? [];
 
-  const fieldById = new Map<string, any>();
+  // build map of fieldId -> title (for fallbacks)
+  const titleById = new Map<string, string>();
   for (const f of fields) {
-    if (f?.id) fieldById.set(f.id, f);
+    if (f?.id && typeof f?.title === "string") titleById.set(f.id, f.title);
   }
 
-  const getTitle = (answer: any) => {
-    const fieldId = answer?.field?.id;
-    const field = fieldId ? fieldById.get(fieldId) : null;
-    return (field?.title ?? "").toString();
+  const getByRef = (ref: string) => {
+    const a = answers.find((x) => x?.field?.ref === ref);
+    if (!a) return null;
+    if (a.type === "text") return a.text ?? null;
+    if (a.type === "email") return a.email ?? null;
+    if (a.type === "phone_number") return a.phone_number ?? null;
+    return null;
   };
 
-  let firstName = "";
-  let lastName = "";
-  let email: string | null = null;
-  let phone: string | null = null;
+  // 1) Try refs first (if you set them)
+  let firstName = (getByRef("first_name") ?? "").toString().trim();
+  let lastName = (getByRef("last_name") ?? "").toString().trim();
+  let email = (getByRef("email") ?? "").toString().trim();
+  let phone = (getByRef("phone") ?? "").toString().trim();
 
-  for (const answer of answers) {
-    const title = normalize(getTitle(answer));
+  // 2) Fallback by answer.type + title matching (Contact Info blocks)
+  if (!email) {
+    const a = answers.find((x) => x?.type === "email" && x?.email);
+    email = (a?.email ?? "").toString().trim();
+  }
+  if (!phone) {
+    const a = answers.find(
+      (x) => x?.type === "phone_number" && x?.phone_number
+    );
+    phone = (a?.phone_number ?? "").toString().trim();
+  }
 
-    if (answer.type === "email") {
-      email = answer.email ?? null;
+  // For names, Contact Info usually sends first/last as text fields.
+  // We'll use title matching to pick them safely.
+  if (!firstName || !lastName) {
+    const textAnswers = answers
+      .filter((x) => x?.type === "text" && typeof x?.text === "string")
+      .map((x) => {
+        const fieldId = x?.field?.id as string | undefined;
+        const title = fieldId ? titleById.get(fieldId) : "";
+        return { title: (title ?? "").toLowerCase(), value: x.text.trim() };
+      });
+
+    if (!firstName) {
+      const hit =
+        textAnswers.find((t) => t.title.includes("first")) ??
+        textAnswers.find((t) => t.title.includes("name") && !t.title.includes("last"));
+      if (hit?.value) firstName = hit.value;
     }
 
-    if (answer.type === "phone_number") {
-      phone = answer.phone_number ?? null;
-    }
-
-    if (answer.type === "text") {
-      if (!firstName && title.includes("first name")) firstName = answer.text ?? "";
-      if (!lastName && title.includes("last name")) lastName = answer.text ?? "";
+    if (!lastName) {
+      const hit =
+        textAnswers.find((t) => t.title.includes("last")) ??
+        textAnswers.find((t) => t.title.includes("surname"));
+      if (hit?.value) lastName = hit.value;
     }
   }
 
   return {
     formId,
     token,
-    firstName: firstName.trim(),
-    lastName: lastName.trim(),
+    firstName,
+    lastName,
     email,
-    phone,
-    answersCount: answers.length
+    phone
   };
-}
-
-async function ensureTables() {
-  if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL.");
-
-  await sql`
-    create table if not exists tenants (
-      id bigserial primary key,
-      form_id text not null unique,
-      location_name text,
-      site_id integer not null,
-      is_active boolean default true,
-      created_at timestamptz default now()
-    );
-  `;
-
-  await sql`
-    create table if not exists processed_submissions (
-      id bigserial primary key,
-      typeform_token text not null unique,
-      created_at timestamptz default now()
-    );
-  `;
 }
 
 export async function POST(req: Request) {
   const rawBody = await req.text();
 
+  // Verify Typeform webhook
   const verification = await verifyTypeform(req, rawBody);
   if (!verification.ok) {
     return NextResponse.json(
@@ -165,21 +189,38 @@ export async function POST(req: Request) {
 
   const lead = extractLead(payload);
 
-  // Typeform "test" pings can be empty
-  if (!lead.formId || !lead.token || lead.answersCount === 0) {
-    return NextResponse.json({ ok: true, status: "typeform_test_ok" });
-  }
-
-  if (!lead.firstName || !lead.lastName) {
+  if (!lead.formId || !lead.token) {
     return NextResponse.json(
-      { ok: false, error: "FirstName and LastName required in Typeform" },
+      { ok: false, error: "Missing form_id or token" },
       { status: 400 }
     );
   }
 
-  await ensureTables();
+  // Enforce names (Mindbody requires)
+  if (!lead.firstName || !lead.lastName) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Missing firstName or lastName from Typeform payload",
+        debug: {
+          extracted: {
+            firstName: lead.firstName,
+            lastName: lead.lastName,
+            email: lead.email,
+            phone: lead.phone
+          }
+        }
+      },
+      { status: 400 }
+    );
+  }
 
-  // Resolve tenant by form_id
+  // Generate unique fallbacks ONLY if missing
+  const finalEmail = lead.email && lead.email.length > 0 ? lead.email : makeFallbackEmail(lead.token);
+  const finalPhoneRaw = lead.phone && lead.phone.length > 0 ? lead.phone : makeFallbackPhone(lead.token);
+  const finalPhone = normalizePhone(finalPhoneRaw);
+
+  // 1) Resolve tenant by form_id
   const tenantRes = await sql`
     select form_id, location_name, site_id, is_active
     from tenants
@@ -187,14 +228,27 @@ export async function POST(req: Request) {
     limit 1
   `;
 
-  const tenant = (tenantRes as any)?.[0];
+  const tenant = tenantRes.rows?.[0] as any;
   if (!tenant || tenant.is_active === false) {
-    return NextResponse.json({ ok: true, status: "routed", routedTo: null });
+    return NextResponse.json({
+      ok: true,
+      status: "routed",
+      routedTo: null,
+      message: "No active tenant for this form_id"
+    });
   }
 
   const siteId = Number(tenant.site_id);
 
-  // Idempotency: prevent double-processing same token
+  // 2) Idempotency: prevent double-processing same Typeform token
+  await sql`
+    create table if not exists processed_submissions (
+      id bigserial primary key,
+      typeform_token text not null unique,
+      created_at timestamptz default now()
+    )
+  `;
+
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -203,26 +257,20 @@ export async function POST(req: Request) {
   } catch {
     return NextResponse.json({
       ok: true,
-      status: "deduped",
+      status: "routed",
+      deduped: true,
       routedTo: { locationName: tenant.location_name, siteId }
     });
   }
 
-  // ✅ Unique fallbacks (no collisions)
-  const normalizedEmail =
-    lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
-
-  const normalizedPhoneRaw =
-    lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
-
-  const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
-
+  // 3) Find or create in Mindbody
   try {
+    // Prefer searching by email/phone first (these are most unique)
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
-      email: normalizedEmail,
-      phone: normalizedPhone
+      email: finalEmail,
+      phone: finalPhone
     });
 
     if (existing?.Id) {
@@ -230,19 +278,26 @@ export async function POST(req: Request) {
         ok: true,
         status: "exists",
         mbClientId: String(existing.Id),
-        routedTo: { locationName: tenant.location_name, siteId }
+        routedTo: { locationName: tenant.location_name, siteId },
+        usedFallbacks: {
+          emailWasFallback: finalEmail !== lead.email,
+          phoneWasFallback: normalizePhone(lead.phone) !== finalPhone
+        }
       });
     }
 
     const created = await createClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
-      email: normalizedEmail,
-      phone: normalizedPhone
+      email: finalEmail,
+      phone: finalPhone
     });
 
     if (!created?.Id) {
-      return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: "Mindbody create failed" },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
@@ -250,21 +305,21 @@ export async function POST(req: Request) {
       status: "created",
       mbClientId: String(created.Id),
       routedTo: { locationName: tenant.location_name, siteId },
-      fallbacksUsed: {
-        emailWasFallback: !lead.email,
-        phoneWasFallback: !lead.phone
+      usedFallbacks: {
+        emailWasFallback: finalEmail !== lead.email,
+        phoneWasFallback: normalizePhone(lead.phone) !== finalPhone
       }
     });
   } catch (err: any) {
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+    const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
     return NextResponse.json(
       {
         ok: false,
         error: err?.message ?? "Server error",
-        mindbody: {
-          status: err?.response?.status ?? null,
-          where: err?.config?.url ?? null,
-          data: err?.response?.data ?? null
-        }
+        mindbody: { status, where, data }
       },
       { status: 500 }
     );
