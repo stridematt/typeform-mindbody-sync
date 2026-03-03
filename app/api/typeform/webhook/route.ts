@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { sql } from "@neondatabase/serverless";
-import { findClient, createClient } from "@/lib/mindbody";
+import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
