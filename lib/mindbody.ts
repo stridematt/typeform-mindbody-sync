@@ -30,9 +30,7 @@ async function getUserToken(siteId: number) {
   const now = Date.now();
   const cached = tokenCache.get(siteId);
 
-  if (cached && cached.expiresAt > now) {
-    return cached.token;
-  }
+  if (cached && cached.expiresAt > now) return cached.token;
 
   const resp = await axios.post(
     `${MINDBODY_BASE_URL}/usertoken/issue`,
@@ -41,26 +39,15 @@ async function getUserToken(siteId: number) {
   );
 
   const token = resp.data?.AccessToken;
-  if (!token) {
-    throw new Error("Mindbody usertoken/issue returned no AccessToken");
-  }
+  if (!token) throw new Error("Mindbody usertoken/issue returned no AccessToken");
 
-  // Cache for 45 minutes
-  tokenCache.set(siteId, {
-    token,
-    expiresAt: now + 45 * 60 * 1000
-  });
-
+  tokenCache.set(siteId, { token, expiresAt: now + 45 * 60 * 1000 });
   return token;
 }
 
 async function authHeaders(siteId: number) {
   const token = await getUserToken(siteId);
-
-  return {
-    ...baseHeaders(siteId),
-    Authorization: `Bearer ${token}`
-  };
+  return { ...baseHeaders(siteId), Authorization: `Bearer ${token}` };
 }
 
 function normalizeEmail(email?: string | null) {
@@ -80,26 +67,39 @@ export type Lead = {
   phone?: string | null;
 };
 
+async function searchClients(siteId: number, searchText: string) {
+  const resp = await axios.get(`${MINDBODY_BASE_URL}/client/clients`, {
+    headers: await authHeaders(siteId),
+    params: { SearchText: searchText, Limit: 5, Offset: 0 },
+    timeout: 15000
+  });
+
+  return resp.data?.Clients ?? [];
+}
+
 export async function findClient(siteId: number, lead: Lead) {
-  const searchText =
-    normalizePhone(lead.phone) || normalizeEmail(lead.email);
+  const email = normalizeEmail(lead.email);
+  const phone = normalizePhone(lead.phone);
 
-  if (!searchText) return null;
+  // 1) Try strict email match
+  if (email) {
+    const clients = await searchClients(siteId, email);
+    const exact = clients.find(
+      (c: any) => normalizeEmail(c?.Email) === email
+    );
+    if (exact) return exact;
+  }
 
-  const resp = await axios.get(
-    `${MINDBODY_BASE_URL}/client/clients`,
-    {
-      headers: await authHeaders(siteId),
-      params: {
-        SearchText: searchText,
-        Limit: 1,
-        Offset: 0
-      },
-      timeout: 15000
-    }
-  );
+  // 2) Try strict phone match
+  if (phone) {
+    const clients = await searchClients(siteId, phone);
+    const exact = clients.find(
+      (c: any) => normalizePhone(c?.MobilePhone) === phone
+    );
+    if (exact) return exact;
+  }
 
-  return resp.data?.Clients?.[0] ?? null;
+  return null;
 }
 
 export async function createClient(siteId: number, lead: Lead) {
@@ -119,10 +119,7 @@ export async function createClient(siteId: number, lead: Lead) {
 
   const data = resp.data;
 
-  /**
-   * Mindbody returns different shapes depending on account configuration.
-   * Normalize into an object with `.Id`
-   */
+  // Normalize response shape into an object with `.Id`
   let client =
     data?.Client ??
     data?.client ??
@@ -130,11 +127,8 @@ export async function createClient(siteId: number, lead: Lead) {
     data;
 
   if (client && !client.Id) {
-    if (data?.ClientId) {
-      client.Id = data.ClientId;
-    } else if (client?.ClientId) {
-      client.Id = client.ClientId;
-    }
+    if (data?.ClientId) client.Id = data.ClientId;
+    else if (client?.ClientId) client.Id = client.ClientId;
   }
 
   return client ?? null;
