@@ -1,17 +1,12 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import {
-  findClient,
-  createClient,
-  addLeadSourceContactLog
-} from "../../../../lib/mindbody";
+import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
 const sql = neon(process.env.DATABASE_URL || "");
 
-const LEAD_SOURCE_LABEL = "Lead Capture Tool";
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 
@@ -57,7 +52,7 @@ function makeDummyPhone(seed: string) {
   const hex = crypto.createHash("sha256").update(seed).digest("hex");
   const digits = hex.replace(/\D/g, "").padEnd(20, "0");
   const last7 = digits.slice(-7);
-  return `${FALLBACK_PHONE_PREFIX}${last7}`;
+  return `${FALLBACK_PHONE_PREFIX}${last7}`; // 10 digits
 }
 
 function makeDummyEmail(seed: string) {
@@ -92,11 +87,13 @@ function extractLead(payload: any) {
     return null;
   };
 
+  // Prefer refs if present
   let firstName = (getByRef("first_name") ?? "").toString().trim();
   let lastName = (getByRef("last_name") ?? "").toString().trim();
   let email = getByRef("email");
   let phone = getByRef("phone");
 
+  // Fallback by title for names
   if (!firstName) {
     const a = answers.find((x) => normalize(getTitle(x)).includes("first name"));
     if (a?.type === "text") firstName = (a.text ?? "").toString().trim();
@@ -107,6 +104,7 @@ function extractLead(payload: any) {
     if (a?.type === "text") lastName = (a.text ?? "").toString().trim();
   }
 
+  // Fallback by answer type for email/phone
   if (!email) {
     const a = answers.find((x) => x?.type === "email");
     email = a?.email ?? null;
@@ -129,7 +127,9 @@ function extractLead(payload: any) {
 }
 
 async function ensureTables() {
-  if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL.");
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Missing DATABASE_URL.");
+  }
 
   await sql`
     create table if not exists tenants (
@@ -180,7 +180,12 @@ export async function POST(req: Request) {
       {
         ok: false,
         error: "Missing firstName or lastName from Typeform payload",
-        extracted: { firstName: lead.firstName, lastName: lead.lastName, email: lead.email, phone: lead.phone }
+        extracted: {
+          firstName: lead.firstName,
+          lastName: lead.lastName,
+          email: lead.email,
+          phone: lead.phone
+        }
       },
       { status: 400 }
     );
@@ -197,11 +202,17 @@ export async function POST(req: Request) {
 
   const tenant = (tenantRows as any)?.[0];
   if (!tenant || tenant.is_active === false) {
-    return NextResponse.json({ ok: true, status: "routed", routedTo: null });
+    return NextResponse.json({
+      ok: true,
+      status: "routed",
+      routedTo: null,
+      message: "No active tenant for this form_id"
+    });
   }
 
   const siteId = Number(tenant.site_id);
 
+  // Idempotency insert
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -215,6 +226,7 @@ export async function POST(req: Request) {
     });
   }
 
+  // Unique fallbacks (no collisions)
   const normalizedEmail =
     lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
 
@@ -232,14 +244,15 @@ export async function POST(req: Request) {
     });
 
     if (existing?.Id) {
-      await addLeadSourceContactLog(siteId, String(existing.Id), LEAD_SOURCE_LABEL);
-
       return NextResponse.json({
         ok: true,
         status: "exists",
         mbClientId: String(existing.Id),
         routedTo: { locationName: tenant.location_name, siteId },
-        leadSource: LEAD_SOURCE_LABEL
+        fallbacksUsed: {
+          emailWasFallback: !lead.email,
+          phoneWasFallback: !lead.phone
+        }
       });
     }
 
@@ -254,14 +267,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
 
-    await addLeadSourceContactLog(siteId, String(created.Id), LEAD_SOURCE_LABEL);
-
     return NextResponse.json({
       ok: true,
       status: "created",
       mbClientId: String(created.Id),
       routedTo: { locationName: tenant.location_name, siteId },
-      leadSource: LEAD_SOURCE_LABEL
+      fallbacksUsed: {
+        emailWasFallback: !lead.email,
+        phoneWasFallback: !lead.phone
+      }
     });
   } catch (err: any) {
     const status = err?.response?.status ?? null;
