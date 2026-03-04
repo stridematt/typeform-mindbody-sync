@@ -1,7 +1,11 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import { findClient, createClient, addLeadSourceContactLog } from "../../../../lib/mindbody";
+import {
+  findClient,
+  createClient,
+  addLeadSourceContactLog
+} from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
@@ -167,7 +171,6 @@ export async function POST(req: Request) {
 
   const lead = extractLead(payload);
 
-  // Typeform “Send test request” often has no real answers
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
     return NextResponse.json({ ok: true, status: "typeform_test_ok" });
   }
@@ -177,12 +180,7 @@ export async function POST(req: Request) {
       {
         ok: false,
         error: "Missing firstName or lastName from Typeform payload",
-        extracted: {
-          firstName: lead.firstName,
-          lastName: lead.lastName,
-          email: lead.email,
-          phone: lead.phone
-        }
+        extracted: { firstName: lead.firstName, lastName: lead.lastName, email: lead.email, phone: lead.phone }
       },
       { status: 400 }
     );
@@ -199,17 +197,11 @@ export async function POST(req: Request) {
 
   const tenant = (tenantRows as any)?.[0];
   if (!tenant || tenant.is_active === false) {
-    return NextResponse.json({
-      ok: true,
-      status: "routed",
-      routedTo: null,
-      message: "No active tenant for this form_id"
-    });
+    return NextResponse.json({ ok: true, status: "routed", routedTo: null });
   }
 
   const siteId = Number(tenant.site_id);
 
-  // Idempotency
   try {
     await sql`
       insert into processed_submissions (typeform_token)
@@ -223,7 +215,6 @@ export async function POST(req: Request) {
     });
   }
 
-  // Unique fallbacks
   const normalizedEmail =
     lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
 
@@ -241,7 +232,6 @@ export async function POST(req: Request) {
     });
 
     if (existing?.Id) {
-      // Always stamp lead source (safe even if already exists)
       await addLeadSourceContactLog(siteId, String(existing.Id), LEAD_SOURCE_LABEL);
 
       return NextResponse.json({
@@ -249,11 +239,7 @@ export async function POST(req: Request) {
         status: "exists",
         mbClientId: String(existing.Id),
         routedTo: { locationName: tenant.location_name, siteId },
-        leadSource: LEAD_SOURCE_LABEL,
-        fallbacksUsed: {
-          emailWasFallback: !lead.email,
-          phoneWasFallback: !lead.phone
-        }
+        leadSource: LEAD_SOURCE_LABEL
       });
     }
 
@@ -268,7 +254,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
 
-    // Stamp lead source on new client
     await addLeadSourceContactLog(siteId, String(created.Id), LEAD_SOURCE_LABEL);
 
     return NextResponse.json({
@@ -276,11 +261,7 @@ export async function POST(req: Request) {
       status: "created",
       mbClientId: String(created.Id),
       routedTo: { locationName: tenant.location_name, siteId },
-      leadSource: LEAD_SOURCE_LABEL,
-      fallbacksUsed: {
-        emailWasFallback: !lead.email,
-        phoneWasFallback: !lead.phone
-      }
+      leadSource: LEAD_SOURCE_LABEL
     });
   } catch (err: any) {
     const status = err?.response?.status ?? null;
