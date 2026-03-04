@@ -47,7 +47,6 @@ function escapeXml(s: string) {
    Avochato payload parsing
 ========================= */
 
-// NEW: Prefer Mindbody ClientID stored on Avochato contact
 function getMindbodyClientIdFromAvochato(body: any): string | null {
   const candidates = [
     body?.contact?.mindbodyClientId,
@@ -202,9 +201,6 @@ function extractClientsFromSoap(xml: string): Array<{
   mobilePhone?: string;
   homePhone?: string;
   workPhone?: string;
-  firstName?: string;
-  lastName?: string;
-  email?: string;
 }> {
   const clients: any[] = [];
   const blocks = xml.match(/<Client\b[\s\S]*?<\/Client>/g) || [];
@@ -220,9 +216,6 @@ function extractClientsFromSoap(xml: string): Array<{
       mobilePhone: get("MobilePhone"),
       homePhone: get("HomePhone"),
       workPhone: get("WorkPhone"),
-      firstName: get("FirstName"),
-      lastName: get("LastName"),
-      email: get("Email"),
     });
   }
 
@@ -282,7 +275,7 @@ async function mindbodyIssueUserToken(siteId: number): Promise<string> {
 
   const json = await r.json().catch(() => ({}));
   if (!r.ok) {
-    throw new Error(`Mindbody usertoken/issue failed ${r.status}: ${JSON.stringify(json).slice(0, 400)}`);
+    throw new Error(`Mindbody usertoken/issue failed ${r.status}: ${JSON.stringify(json).slice(0, 500)}`);
   }
 
   const token = json?.AccessToken || json?.access_token || json?.Token;
@@ -299,15 +292,16 @@ async function mindbodyAddContactLog(params: {
   text: string;
 }): Promise<any> {
   const apiKey = mustEnv("MINDBODY_API_KEY");
-  const typeId = Number(mustEnv("MINDBODY_CONTACT_LOG_TYPE_ID")); // "Avochato Summary"
+  const typeId = Number(mustEnv("MINDBODY_CONTACT_LOG_TYPE_ID"));
 
+  // IMPORTANT: Mindbody expects PascalCase and ClientId specifically
   const payload = {
-    client_id: params.clientId,
-    text: params.text,
-    contact_method: "Phone",
-    contact_name: params.contactName,
-    types: [{ id: typeId }],
-    test: false,
+    ClientId: params.clientId,
+    Text: params.text,
+    ContactMethod: "Phone",
+    ContactName: params.contactName,
+    TypeId: typeId,
+    Test: false,
   };
 
   const r = await fetch("https://api.mindbodyonline.com/public/v6/client/addcontactlog", {
@@ -323,7 +317,7 @@ async function mindbodyAddContactLog(params: {
 
   const json = await r.json().catch(() => ({}));
   if (!r.ok) {
-    throw new Error(`Mindbody addcontactlog failed ${r.status}: ${JSON.stringify(json).slice(0, 500)}`);
+    throw new Error(`Mindbody addcontactlog failed ${r.status}: ${JSON.stringify(json).slice(0, 800)}`);
   }
 
   return json;
@@ -337,7 +331,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // Auth: allow either header secret or ?secret= query param
+    // Auth
     const expected = mustEnv("AVOCHATO_WEBHOOK_SECRET");
     const headerSecret = firstVal(req.headers["x-avochato-secret"] as any);
     const querySecret = firstVal(req.query.secret as any);
@@ -353,10 +347,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const contactName = getContactName(body);
     const logText = buildContactLogText(body);
 
-    // NEW: Use Mindbody ClientID from Avochato if present
+    // Prefer ClientID from Avochato
     let clientId = getMindbodyClientIdFromAvochato(body);
 
-    // Fallback: match by phone
+    // Fallback: phone lookup
     if (!clientId) {
       const mobile = getAvochatoMobile(body);
       if (!mobile.key10) {
