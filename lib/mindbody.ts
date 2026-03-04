@@ -1,3 +1,4 @@
+// lib/mindbody.ts
 import axios from "axios";
 
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
@@ -8,30 +9,32 @@ function requireEnv(name: string) {
   return v;
 }
 
-function parseSiteId(value: string, envName: string) {
-  const cleaned = value.trim();
-  if (!/^\d+$/.test(cleaned)) {
-    throw new Error(`${envName} must be digits only. Got: "${value}"`);
+function assertValidSiteId(siteId: number) {
+  if (!Number.isInteger(siteId) || siteId <= 0) {
+    throw new Error(`Invalid siteId: ${siteId}`);
   }
-  const n = Number(cleaned);
-  if (!Number.isInteger(n) || n <= 0) {
-    throw new Error(`${envName} must be a positive integer. Got: "${value}"`);
-  }
-  return n;
+  return siteId;
 }
 
 /**
- * Issue a Mindbody user token.
- * Some accounts require a SiteId header here, and it must be a valid numeric site.
- * We use MINDBODY_TOKEN_SITE_ID for this purpose.
+ * Issue a Mindbody user token for the SAME SiteId you will call next.
+ * This avoids "token site id does not match requested site" and removes the need
+ * for MINDBODY_TOKEN_SITE_ID entirely.
  */
-async function getToken() {
+const tokenCache = new Map<number, { token: string; issuedAt: number }>();
+const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes (safe default)
+
+async function getToken(siteId: number) {
+  assertValidSiteId(siteId);
+
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const username = requireEnv("MINDBODY_USERNAME");
   const password = requireEnv("MINDBODY_PASSWORD");
 
-  const tokenSiteIdRaw = requireEnv("MINDBODY_TOKEN_SITE_ID");
-  const tokenSiteId = parseSiteId(tokenSiteIdRaw, "MINDBODY_TOKEN_SITE_ID");
+  const cached = tokenCache.get(siteId);
+  if (cached && Date.now() - cached.issuedAt < TOKEN_TTL_MS) {
+    return cached.token;
+  }
 
   const res = await axios.post(
     `${BASE_URL}/usertoken/issue`,
@@ -40,10 +43,9 @@ async function getToken() {
       headers: {
         "Content-Type": "application/json",
         "Api-Key": apiKey,
-        // Important: use a known-good site id here (digits only)
-        SiteId: String(tokenSiteId)
+        SiteId: String(siteId),
       },
-      timeout: 20000
+      timeout: 20000,
     }
   );
 
@@ -51,16 +53,16 @@ async function getToken() {
   if (!accessToken) {
     throw new Error("Mindbody token response missing AccessToken");
   }
+
+  tokenCache.set(siteId, { token: accessToken, issuedAt: Date.now() });
   return accessToken;
 }
 
 async function mbClient(siteId: number) {
-  const apiKey = requireEnv("MINDBODY_API_KEY");
-  const token = await getToken();
+  assertValidSiteId(siteId);
 
-  if (!Number.isInteger(siteId) || siteId <= 0) {
-    throw new Error(`Invalid siteId passed to mbClient: ${siteId}`);
-  }
+  const apiKey = requireEnv("MINDBODY_API_KEY");
+  const token = await getToken(siteId);
 
   return axios.create({
     baseURL: BASE_URL,
@@ -69,21 +71,22 @@ async function mbClient(siteId: number) {
       "Content-Type": "application/json",
       "Api-Key": apiKey,
       Authorization: `Bearer ${token}`,
-      SiteId: String(siteId)
-    }
+      SiteId: String(siteId),
+    },
   });
 }
 
 export async function findClient(
   siteId: number,
-  input: { firstName: string; lastName: string; email: string; phone: string }
+  input: { firstName?: string; lastName?: string; email?: string; phone?: string }
 ) {
   const client = await mbClient(siteId);
 
   const candidates: string[] = [];
   if (input.email) candidates.push(input.email);
   if (input.phone) candidates.push(input.phone);
-  const fullName = `${input.firstName} ${input.lastName}`.trim();
+
+  const fullName = `${input.firstName ?? ""} ${input.lastName ?? ""}`.trim();
   if (fullName) candidates.push(fullName);
 
   for (const q of candidates) {
@@ -97,16 +100,16 @@ export async function findClient(
 
 export async function createClient(
   siteId: number,
-  input: { firstName: string; lastName: string; email: string; phone: string }
+  input: { firstName: string; lastName: string; email?: string; phone?: string }
 ) {
   const client = await mbClient(siteId);
 
   const payload = {
     FirstName: input.firstName,
     LastName: input.lastName,
-    Email: input.email,
-    MobilePhone: input.phone,
-    IsProspect: true
+    Email: input.email ?? "",
+    MobilePhone: input.phone ?? "",
+    IsProspect: true,
   };
 
   const res = await client.post(`/client/addclient`, payload);
