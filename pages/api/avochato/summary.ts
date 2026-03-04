@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "crypto";
 
 /* =========================
-   Small utilities
+   Utilities
 ========================= */
 
 function mustEnv(name: string): string {
@@ -47,9 +47,31 @@ function escapeXml(s: string) {
    Avochato payload parsing
 ========================= */
 
+// NEW: Prefer Mindbody ClientID stored on Avochato contact
+function getMindbodyClientIdFromAvochato(body: any): string | null {
+  const candidates = [
+    body?.contact?.mindbodyClientId,
+    body?.contact?.mindbody_client_id,
+    body?.contact?.custom_fields?.mindbodyClientId,
+    body?.contact?.custom_fields?.mindbody_client_id,
+    body?.contact?.customFields?.mindbodyClientId,
+    body?.conversation?.contact?.mindbodyClientId,
+    body?.conversation?.contact?.mindbody_client_id,
+    body?.conversation?.contact?.custom_fields?.mindbodyClientId,
+    body?.conversation?.contact?.custom_fields?.mindbody_client_id,
+  ];
+
+  for (const c of candidates) {
+    if (c === null || c === undefined) continue;
+    const s = String(c).trim();
+    if (s) return s;
+  }
+  return null;
+}
+
 function getAvochatoMobile(body: any): { raw?: string; key10?: string } {
   const candidates = [
-    body?.contact?.mobile_number, // your Postman payload
+    body?.contact?.mobile_number,
     body?.contact?.mobileNumber,
     body?.contact?.mobile,
     body?.contact?.phone_number,
@@ -115,7 +137,7 @@ function buildContactLogText(body: any): string {
 }
 
 /* =========================
-   Mindbody SOAP: GetClients
+   Mindbody SOAP: GetClients (fallback only)
 ========================= */
 
 async function mindbodySoapGetClients(params: {
@@ -128,7 +150,6 @@ async function mindbodySoapGetClients(params: {
   const sourceName = mustEnv("MINDBODY_SOURCE_NAME");
   const sourcePass = mustEnv("MINDBODY_SOURCE_PASSWORD");
 
-  // Important: Fields ensures phones come back in response
   const xml = `<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -216,8 +237,8 @@ async function mindbodyFindClientIdByPhone(params: {
   const variants = Array.from(
     new Set(
       [
-        params.phoneKey10, // best for US
-        params.fullDigits, // sometimes works
+        params.phoneKey10,
+        params.fullDigits,
         params.fullDigits.length === 11 && params.fullDigits.startsWith("1") ? params.fullDigits.slice(1) : "",
       ].filter(Boolean)
     )
@@ -228,18 +249,6 @@ async function mindbodyFindClientIdByPhone(params: {
     const clients = extractClientsFromSoap(xml);
 
     console.log("SOAP searchText:", searchText, "clientsReturned:", clients.length);
-    if (clients.length) {
-      const c0 = clients[0];
-      console.log("SOAP first client sample:", {
-        id: c0.id,
-        firstName: c0.firstName,
-        lastName: c0.lastName,
-        mobilePhone: c0.mobilePhone,
-        homePhone: c0.homePhone,
-        workPhone: c0.workPhone,
-        email: c0.email,
-      });
-    }
 
     const hit = clients.find((c) => {
       const phones = [c.mobilePhone, c.homePhone, c.workPhone].map((p) => last10Digits(p));
@@ -328,7 +337,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // Auth: header OR query
+    // Auth: allow either header secret or ?secret= query param
     const expected = mustEnv("AVOCHATO_WEBHOOK_SECRET");
     const headerSecret = firstVal(req.headers["x-avochato-secret"] as any);
     const querySecret = firstVal(req.query.secret as any);
@@ -341,32 +350,42 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const body = req.body || {};
     const siteId = Number(mustEnv("MINDBODY_SITE_ID_HB"));
 
-    const mobile = getAvochatoMobile(body);
-    if (!mobile.key10) return res.status(400).json({ error: "Phone number missing in payload" });
-
-    const fullDigits = digitsOnly(mobile.raw || "");
     const contactName = getContactName(body);
     const logText = buildContactLogText(body);
 
-    console.log("Incoming phone raw:", mobile.raw, "phoneKey10:", mobile.key10, "fullDigits:", fullDigits);
-    console.log("Using siteId:", siteId);
+    // NEW: Use Mindbody ClientID from Avochato if present
+    let clientId = getMindbodyClientIdFromAvochato(body);
 
-    // 1) Find Mindbody client by phone (SOAP)
-    const clientId = await mindbodyFindClientIdByPhone({
-      siteId,
-      phoneKey10: mobile.key10,
-      fullDigits,
-    });
-
+    // Fallback: match by phone
     if (!clientId) {
-      return res.status(202).json({
-        ok: true,
-        message: "Webhook received but client not found",
-        phone: mobile.key10,
+      const mobile = getAvochatoMobile(body);
+      if (!mobile.key10) {
+        return res.status(400).json({
+          error: "mindbodyClientId not provided and phone number missing in payload",
+        });
+      }
+
+      const fullDigits = digitsOnly(mobile.raw || "");
+      console.log("Fallback phone raw:", mobile.raw, "phoneKey10:", mobile.key10, "fullDigits:", fullDigits);
+
+      clientId = await mindbodyFindClientIdByPhone({
+        siteId,
+        phoneKey10: mobile.key10,
+        fullDigits,
       });
+
+      if (!clientId) {
+        return res.status(202).json({
+          ok: true,
+          message: "Webhook received but client not found",
+          phone: mobile.key10,
+        });
+      }
+    } else {
+      console.log("Using mindbodyClientId from Avochato:", clientId);
     }
 
-    // 2) Create contact log (Public API v6)
+    // Create contact log
     const token = await mindbodyIssueUserToken(siteId);
     const mbResp = await mindbodyAddContactLog({
       siteId,
@@ -379,7 +398,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json({
       ok: true,
       clientId,
-      phone: mobile.key10,
       mindbody: mbResp,
     });
   } catch (err: any) {
