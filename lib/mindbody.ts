@@ -1,6 +1,9 @@
 import axios from "axios";
 
-const BASE_URL = "https://api.mindbodyonline.com/public/v6";
+const MBO_BASE_URL = "https://api.mindbodyonline.com/public/v6";
+
+type TokenCacheEntry = { token: string; expiresAt: number };
+const tokenCache = new Map<number, TokenCacheEntry>();
 
 function requireEnv(name: string) {
   const v = process.env[name];
@@ -8,100 +11,98 @@ function requireEnv(name: string) {
   return v;
 }
 
-function parseSiteId(value: string, envName: string) {
-  const cleaned = value.trim();
-  if (!/^\d+$/.test(cleaned)) {
-    throw new Error(`${envName} must be digits only. Got: "${value}"`);
-  }
-  const n = Number(cleaned);
-  if (!Number.isInteger(n) || n <= 0) {
-    throw new Error(`${envName} must be a positive integer. Got: "${value}"`);
-  }
-  return n;
+function nowMs() {
+  return Date.now();
 }
 
-/**
- * Issue a Mindbody user token.
- * Some accounts require a SiteId header here, and it must be a valid numeric site.
- * We use MINDBODY_TOKEN_SITE_ID for this purpose.
- */
-async function getToken() {
+async function getUserToken(siteId: number) {
+  const cached = tokenCache.get(siteId);
+  if (cached && cached.expiresAt > nowMs() + 30_000) return cached.token;
+
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const username = requireEnv("MINDBODY_USERNAME");
   const password = requireEnv("MINDBODY_PASSWORD");
 
-  const tokenSiteIdRaw = requireEnv("MINDBODY_TOKEN_SITE_ID");
-  const tokenSiteId = parseSiteId(tokenSiteIdRaw, "MINDBODY_TOKEN_SITE_ID");
+  const url = `${MBO_BASE_URL}/usertoken/issue`;
 
   const res = await axios.post(
-    `${BASE_URL}/usertoken/issue`,
-    { Username: username, Password: password },
+    url,
+    { Username: username, Password: password, SiteId: siteId },
     {
       headers: {
-        "Content-Type": "application/json",
         "Api-Key": apiKey,
-        // Important: use a known-good site id here (digits only)
-        SiteId: String(tokenSiteId)
+        "Content-Type": "application/json"
       },
-      timeout: 20000
+      timeout: 20_000
     }
   );
 
-  const accessToken = res.data?.AccessToken as string | undefined;
-  if (!accessToken) {
-    throw new Error("Mindbody token response missing AccessToken");
-  }
-  return accessToken;
+  const token = res.data?.AccessToken || res.data?.access_token;
+  const expiresIn = Number(res.data?.ExpiresIn ?? res.data?.expires_in ?? 900);
+
+  if (!token) throw new Error("Mindbody token response missing AccessToken");
+
+  tokenCache.set(siteId, { token, expiresAt: nowMs() + expiresIn * 1000 });
+  return token;
 }
 
-async function mbClient(siteId: number) {
-  const apiKey = requireEnv("MINDBODY_API_KEY");
-  const token = await getToken();
-
-  if (!Number.isInteger(siteId) || siteId <= 0) {
-    throw new Error(`Invalid siteId passed to mbClient: ${siteId}`);
-  }
-
-  return axios.create({
-    baseURL: BASE_URL,
-    timeout: 25000,
-    headers: {
-      "Content-Type": "application/json",
-      "Api-Key": apiKey,
-      Authorization: `Bearer ${token}`,
-      SiteId: String(siteId)
-    }
-  });
+function authHeaders(apiKey: string, token?: string) {
+  const h: Record<string, string> = {
+    "Api-Key": apiKey,
+    "Content-Type": "application/json"
+  };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
 }
 
 export async function findClient(
   siteId: number,
-  input: { firstName: string; lastName: string; email: string; phone: string }
+  input: { firstName?: string; lastName?: string; email?: string | null; phone?: string | null }
 ) {
-  const client = await mbClient(siteId);
+  const apiKey = requireEnv("MINDBODY_API_KEY");
+  const token = await getUserToken(siteId);
 
-  const candidates: string[] = [];
-  if (input.email) candidates.push(input.email);
-  if (input.phone) candidates.push(input.phone);
-  const fullName = `${input.firstName} ${input.lastName}`.trim();
-  if (fullName) candidates.push(fullName);
+  const searchText =
+    (input.email && input.email.trim()) ||
+    (input.phone && input.phone.trim()) ||
+    `${input.firstName ?? ""} ${input.lastName ?? ""}`.trim();
 
-  for (const q of candidates) {
-    const res = await client.get(`/client/clients`, { params: { SearchText: q } });
-    const found = res.data?.Clients?.[0];
-    if (found?.Id) return found;
-  }
+  const url = `${MBO_BASE_URL}/client/clients`;
 
-  return null;
+  const res = await axios.get(url, {
+    headers: authHeaders(apiKey, token),
+    params: {
+      SearchText: searchText,
+      IsProspect: true
+    },
+    timeout: 20_000
+  });
+
+  const clients: any[] = res.data?.Clients ?? [];
+  if (!clients.length) return null;
+
+  const emailNorm = (input.email ?? "").toLowerCase().trim();
+  const phoneDigits = (input.phone ?? "").replace(/\D/g, "");
+
+  const exact = clients.find((c) => {
+    const cEmail = (c?.Email ?? "").toLowerCase().trim();
+    const cPhone = (c?.MobilePhone ?? "").replace(/\D/g, "");
+    return (emailNorm && cEmail === emailNorm) || (phoneDigits && cPhone === phoneDigits);
+  });
+
+  return exact ?? clients[0] ?? null;
 }
 
 export async function createClient(
   siteId: number,
   input: { firstName: string; lastName: string; email: string; phone: string }
 ) {
-  const client = await mbClient(siteId);
+  const apiKey = requireEnv("MINDBODY_API_KEY");
+  const token = await getUserToken(siteId);
 
-  const payload = {
+  const url = `${MBO_BASE_URL}/client/addclient`;
+
+  const payload: any = {
     FirstName: input.firstName,
     LastName: input.lastName,
     Email: input.email,
@@ -109,6 +110,42 @@ export async function createClient(
     IsProspect: true
   };
 
-  const res = await client.post(`/client/addclient`, payload);
-  return res.data?.Client ?? null;
+  const res = await axios.post(url, payload, {
+    headers: authHeaders(apiKey, token),
+    timeout: 20_000
+  });
+
+  return res.data?.Client ?? res.data ?? null;
+}
+
+export async function addLeadSourceContactLog(
+  siteId: number,
+  clientId: string,
+  leadSourceLabel: string
+) {
+  const apiKey = requireEnv("MINDBODY_API_KEY");
+  const token = await getUserToken(siteId);
+
+  const url = `${MBO_BASE_URL}/client/addcontactlog`;
+
+  const assignedToStaffIdRaw = process.env.MINDBODY_ASSIGNED_TO_STAFF_ID;
+  const assignedToStaffId = assignedToStaffIdRaw ? Number(assignedToStaffIdRaw) : undefined;
+
+  const payload: any = {
+    ClientId: clientId,
+    Text: `Lead Source: ${leadSourceLabel}`,
+    ContactName: leadSourceLabel,
+    ContactMethod: "Other"
+  };
+
+  if (Number.isFinite(assignedToStaffId)) {
+    payload.AssignedToStaffId = assignedToStaffId;
+  }
+
+  const res = await axios.post(url, payload, {
+    headers: authHeaders(apiKey, token),
+    timeout: 20_000
+  });
+
+  return res.data ?? null;
 }
