@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import { findClient, createClient } from "../../../../lib/mindbody";
+import { findClient, createClient, addLeadSourceContactLog } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
 const sql = neon(process.env.DATABASE_URL || "");
 
+const LEAD_SOURCE_LABEL = "Lead Capture Tool";
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 
@@ -17,9 +18,6 @@ function timingSafeEqual(a: string, b: string) {
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
-/**
- * Typeform-Signature: sha256=<base64(hmac_sha256(secret, rawBody))>
- */
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
@@ -41,7 +39,6 @@ async function verifyTypeform(req: Request, rawBody: string) {
     return { ok: timingSafeEqual(provided, expected) };
   }
 
-  // Optional fallback for Postman/manual calls
   const headerSecret = req.headers.get("typeform-secret");
   if (headerSecret && headerSecret === secret) return { ok: true };
 
@@ -52,23 +49,15 @@ function normalize(s: string) {
   return s.toLowerCase().trim();
 }
 
-/**
- * Unique fallback phone per submission:
- * 555 + 7 digits derived from hash(token)
- */
-function makeDummyPhone(token: string) {
-  const hex = crypto.createHash("sha256").update(token).digest("hex");
-  const digits = hex.replace(/\D/g, "").padEnd(30, "0");
+function makeDummyPhone(seed: string) {
+  const hex = crypto.createHash("sha256").update(seed).digest("hex");
+  const digits = hex.replace(/\D/g, "").padEnd(20, "0");
   const last7 = digits.slice(-7);
-  return `${FALLBACK_PHONE_PREFIX}${last7}`; // 10 digits
+  return `${FALLBACK_PHONE_PREFIX}${last7}`;
 }
 
-/**
- * Unique fallback email per submission:
- * pending+<short>@strideautomation.com
- */
-function makeDummyEmail(token: string) {
-  const short = crypto.createHash("sha256").update(token).digest("hex").slice(0, 10);
+function makeDummyEmail(seed: string) {
+  const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
   return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
 }
 
@@ -90,7 +79,6 @@ function extractLead(payload: any) {
     return (field?.title ?? "").toString();
   };
 
-  // Try refs first (if present)
   const getByRef = (ref: string) => {
     const a = answers.find((x) => x?.field?.ref === ref);
     if (!a) return null;
@@ -105,21 +93,21 @@ function extractLead(payload: any) {
   let email = getByRef("email");
   let phone = getByRef("phone");
 
-  // Fallback by field titles (Contact Info blocks)
   if (!firstName) {
     const a = answers.find((x) => normalize(getTitle(x)).includes("first name"));
     if (a?.type === "text") firstName = (a.text ?? "").toString().trim();
   }
+
   if (!lastName) {
     const a = answers.find((x) => normalize(getTitle(x)).includes("last name"));
     if (a?.type === "text") lastName = (a.text ?? "").toString().trim();
   }
 
-  // Fallback by answer type
   if (!email) {
     const a = answers.find((x) => x?.type === "email");
     email = a?.email ?? null;
   }
+
   if (!phone) {
     const a = answers.find((x) => x?.type === "phone_number");
     phone = a?.phone_number ?? null;
@@ -137,9 +125,7 @@ function extractLead(payload: any) {
 }
 
 async function ensureTables() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL. Connect Neon in Vercel to set it.");
-  }
+  if (!process.env.DATABASE_URL) throw new Error("Missing DATABASE_URL.");
 
   await sql`
     create table if not exists tenants (
@@ -181,7 +167,7 @@ export async function POST(req: Request) {
 
   const lead = extractLead(payload);
 
-  // Typeform test can come in empty
+  // Typeform “Send test request” often has no real answers
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
     return NextResponse.json({ ok: true, status: "typeform_test_ok" });
   }
@@ -204,15 +190,14 @@ export async function POST(req: Request) {
 
   await ensureTables();
 
-  // Tenant lookup
-  const tenantRes = await sql`
+  const tenantRows = await sql`
     select form_id, location_name, site_id, is_active
     from tenants
     where form_id = ${lead.formId}
     limit 1
   `;
 
-  const tenant = (tenantRes as any)?.[0];
+  const tenant = (tenantRows as any)?.[0];
   if (!tenant || tenant.is_active === false) {
     return NextResponse.json({
       ok: true,
@@ -238,7 +223,7 @@ export async function POST(req: Request) {
     });
   }
 
-  // Unique fallbacks (avoid collisions)
+  // Unique fallbacks
   const normalizedEmail =
     lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
 
@@ -256,11 +241,15 @@ export async function POST(req: Request) {
     });
 
     if (existing?.Id) {
+      // Always stamp lead source (safe even if already exists)
+      await addLeadSourceContactLog(siteId, String(existing.Id), LEAD_SOURCE_LABEL);
+
       return NextResponse.json({
         ok: true,
         status: "exists",
         mbClientId: String(existing.Id),
         routedTo: { locationName: tenant.location_name, siteId },
+        leadSource: LEAD_SOURCE_LABEL,
         fallbacksUsed: {
           emailWasFallback: !lead.email,
           phoneWasFallback: !lead.phone
@@ -279,11 +268,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
 
+    // Stamp lead source on new client
+    await addLeadSourceContactLog(siteId, String(created.Id), LEAD_SOURCE_LABEL);
+
     return NextResponse.json({
       ok: true,
       status: "created",
       mbClientId: String(created.Id),
       routedTo: { locationName: tenant.location_name, siteId },
+      leadSource: LEAD_SOURCE_LABEL,
       fallbacksUsed: {
         emailWasFallback: !lead.email,
         phoneWasFallback: !lead.phone
@@ -295,11 +288,7 @@ export async function POST(req: Request) {
     const where = typeof err?.config?.url === "string" ? err.config.url : null;
 
     return NextResponse.json(
-      {
-        ok: false,
-        error: err?.message ?? "Server error",
-        mindbody: { status, where, data }
-      },
+      { ok: false, error: err?.message ?? "Server error", mindbody: { status, where, data } },
       { status: 500 }
     );
   }
