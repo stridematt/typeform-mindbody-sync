@@ -1,3 +1,4 @@
+// /pages/api/avochato/summary.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "crypto";
 
@@ -47,25 +48,84 @@ function escapeXml(s: string) {
    Avochato payload parsing
 ========================= */
 
+/**
+ * Bulletproof extraction of Mindbody ClientId from any shape:
+ * - contact.mindbodyClientId
+ * - custom_fields objects
+ * - custom_fields arrays
+ * - nested variants
+ * - tags like "mb:123" or "mindbodyClientId=123"
+ */
 function getMindbodyClientIdFromAvochato(body: any): string | null {
-  const candidates = [
+  // 1) Common direct locations
+  const directCandidates = [
     body?.contact?.mindbodyClientId,
     body?.contact?.mindbody_client_id,
-    body?.contact?.custom_fields?.mindbodyClientId,
-    body?.contact?.custom_fields?.mindbody_client_id,
-    body?.contact?.customFields?.mindbodyClientId,
+    body?.contact?.MindbodyClientId,
     body?.conversation?.contact?.mindbodyClientId,
     body?.conversation?.contact?.mindbody_client_id,
-    body?.conversation?.contact?.custom_fields?.mindbodyClientId,
-    body?.conversation?.contact?.custom_fields?.mindbody_client_id,
   ];
 
-  for (const c of candidates) {
+  for (const c of directCandidates) {
     if (c === null || c === undefined) continue;
     const s = String(c).trim();
     if (s) return s;
   }
-  return null;
+
+  // 2) Tags fallback: mb:123 or mindbodyClientId:123 or mindbodyClientId=123
+  const tags: any[] = body?.contact?.tags || body?.tags || [];
+  if (Array.isArray(tags)) {
+    for (const t of tags) {
+      const s = String(t || "").trim();
+      const m = s.match(/(?:^|\s)(?:mb|mindbodyclientid)\s*[:=]\s*(\d+)\s*$/i);
+      if (m?.[1]) return m[1];
+    }
+  }
+
+  // 3) Recursive scan for any key that looks like mindbody client id
+  const visited = new Set<any>();
+  const walk = (node: any): string | null => {
+    if (!node || typeof node !== "object") return null;
+    if (visited.has(node)) return null;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const hit = walk(item);
+        if (hit) return hit;
+      }
+      return null;
+    }
+
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof k === "string" && /mindbody.*client.*id/i.test(k)) {
+        const s = String(v ?? "").trim();
+        if (s) return s;
+      }
+
+      // Special case: arrays of custom_fields like [{name:"mindbodyClientId", value:"123"}]
+      if (
+        (k === "custom_fields" || k === "customFields" || /custom.*field/i.test(k)) &&
+        Array.isArray(v)
+      ) {
+        for (const item of v as any[]) {
+          const name = String((item as any)?.name ?? (item as any)?.key ?? "").trim();
+          const value = (item as any)?.value ?? (item as any)?.val ?? (item as any)?.data;
+          if (/mindbody.*client.*id/i.test(name)) {
+            const s = String(value ?? "").trim();
+            if (s) return s;
+          }
+        }
+      }
+
+      const hit = walk(v);
+      if (hit) return hit;
+    }
+
+    return null;
+  };
+
+  return walk(body);
 }
 
 function getAvochatoMobile(body: any): { raw?: string; key10?: string } {
@@ -139,10 +199,7 @@ function buildContactLogText(body: any): string {
    Mindbody SOAP: GetClients (fallback only)
 ========================= */
 
-async function mindbodySoapGetClients(params: {
-  siteId: number;
-  searchText: string;
-}): Promise<string> {
+async function mindbodySoapGetClients(params: { siteId: number; searchText: string }): Promise<string> {
   const soapUrl = "https://api.mindbodyonline.com/0_5_1/ClientService.asmx";
   const soapAction = "http://clients.mindbodyonline.com/api/0_5_1/GetClients";
 
@@ -159,9 +216,7 @@ async function mindbodySoapGetClients(params: {
         <SourceCredentials>
           <SourceName>${escapeXml(sourceName)}</SourceName>
           <Password>${escapeXml(sourcePass)}</Password>
-          <SiteIDs>
-            <int>${params.siteId}</int>
-          </SiteIDs>
+          <SiteIDs><int>${params.siteId}</int></SiteIDs>
         </SourceCredentials>
 
         <SearchText>${escapeXml(params.searchText)}</SearchText>
@@ -170,9 +225,6 @@ async function mindbodySoapGetClients(params: {
 
         <Fields>
           <string>Clients.ID</string>
-          <string>Clients.FirstName</string>
-          <string>Clients.LastName</string>
-          <string>Clients.Email</string>
           <string>Clients.MobilePhone</string>
           <string>Clients.HomePhone</string>
           <string>Clients.WorkPhone</string>
@@ -184,10 +236,7 @@ async function mindbodySoapGetClients(params: {
 
   const r = await fetch(soapUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "text/xml; charset=utf-8",
-      SOAPAction: soapAction,
-    },
+    headers: { "Content-Type": "text/xml; charset=utf-8", SOAPAction: soapAction },
     body: xml,
   });
 
@@ -196,14 +245,9 @@ async function mindbodySoapGetClients(params: {
   return text;
 }
 
-function extractClientsFromSoap(xml: string): Array<{
-  id?: string;
-  mobilePhone?: string;
-  homePhone?: string;
-  workPhone?: string;
-}> {
-  const clients: any[] = [];
+function extractClientsFromSoap(xml: string): Array<{ id?: string; mobilePhone?: string; homePhone?: string; workPhone?: string }> {
   const blocks = xml.match(/<Client\b[\s\S]*?<\/Client>/g) || [];
+  const clients: any[] = [];
 
   for (const b of blocks) {
     const get = (tag: string) => {
@@ -222,11 +266,7 @@ function extractClientsFromSoap(xml: string): Array<{
   return clients;
 }
 
-async function mindbodyFindClientIdByPhone(params: {
-  siteId: number;
-  phoneKey10: string;
-  fullDigits: string;
-}): Promise<string | null> {
+async function mindbodyFindClientIdByPhone(params: { siteId: number; phoneKey10: string; fullDigits: string }): Promise<string | null> {
   const variants = Array.from(
     new Set(
       [
@@ -265,18 +305,12 @@ async function mindbodyIssueUserToken(siteId: number): Promise<string> {
 
   const r = await fetch("https://api.mindbodyonline.com/public/v6/usertoken/issue", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Api-Key": apiKey,
-      SiteId: String(siteId),
-    },
+    headers: { "Content-Type": "application/json", "Api-Key": apiKey, SiteId: String(siteId) },
     body: JSON.stringify({ Username: username, Password: password }),
   });
 
   const json = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    throw new Error(`Mindbody usertoken/issue failed ${r.status}: ${JSON.stringify(json).slice(0, 500)}`);
-  }
+  if (!r.ok) throw new Error(`Mindbody usertoken/issue failed ${r.status}: ${JSON.stringify(json).slice(0, 500)}`);
 
   const token = json?.AccessToken || json?.access_token || json?.Token;
   if (!token) throw new Error(`Mindbody token missing: ${JSON.stringify(json).slice(0, 300)}`);
@@ -294,7 +328,7 @@ async function mindbodyAddContactLog(params: {
   const apiKey = mustEnv("MINDBODY_API_KEY");
   const typeId = Number(mustEnv("MINDBODY_CONTACT_LOG_TYPE_ID"));
 
-  // IMPORTANT: Mindbody expects PascalCase and ClientId specifically
+  // Mindbody expects PascalCase and specifically ClientId
   const payload = {
     ClientId: params.clientId,
     Text: params.text,
@@ -316,9 +350,7 @@ async function mindbodyAddContactLog(params: {
   });
 
   const json = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    throw new Error(`Mindbody addcontactlog failed ${r.status}: ${JSON.stringify(json).slice(0, 800)}`);
-  }
+  if (!r.ok) throw new Error(`Mindbody addcontactlog failed ${r.status}: ${JSON.stringify(json).slice(0, 800)}`);
 
   return json;
 }
@@ -331,7 +363,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // Auth
+    // Auth (header OR query param)
     const expected = mustEnv("AVOCHATO_WEBHOOK_SECRET");
     const headerSecret = firstVal(req.headers["x-avochato-secret"] as any);
     const querySecret = firstVal(req.query.secret as any);
@@ -344,13 +376,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const body = req.body || {};
     const siteId = Number(mustEnv("MINDBODY_SITE_ID_HB"));
 
+    // Debug: confirm extraction in logs
+    const extractedClientId = getMindbodyClientIdFromAvochato(body);
+    console.log("Extracted mindbodyClientId:", extractedClientId);
+
     const contactName = getContactName(body);
     const logText = buildContactLogText(body);
 
-    // Prefer ClientID from Avochato
-    let clientId = getMindbodyClientIdFromAvochato(body);
+    // Prefer ClientId stored on Avochato
+    let clientId = extractedClientId;
 
-    // Fallback: phone lookup
+    // Fallback to phone lookup if no client id provided/found
     if (!clientId) {
       const mobile = getAvochatoMobile(body);
       if (!mobile.key10) {
@@ -375,11 +411,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           phone: mobile.key10,
         });
       }
-    } else {
-      console.log("Using mindbodyClientId from Avochato:", clientId);
     }
 
-    // Create contact log
+    // Create contact log (Public API v6)
     const token = await mindbodyIssueUserToken(siteId);
     const mbResp = await mindbodyAddContactLog({
       siteId,
@@ -389,11 +423,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       text: logText,
     });
 
-    return res.status(200).json({
-      ok: true,
-      clientId,
-      mindbody: mbResp,
-    });
+    return res.status(200).json({ ok: true, clientId, mindbody: mbResp });
   } catch (err: any) {
     console.error(err);
     return res.status(500).json({ error: err?.message || "Server error" });
