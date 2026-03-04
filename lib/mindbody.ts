@@ -22,7 +22,7 @@ function assertValidSiteId(siteId: number) {
  * for MINDBODY_TOKEN_SITE_ID entirely.
  */
 const tokenCache = new Map<number, { token: string; issuedAt: number }>();
-const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes (safe default)
+const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 async function getToken(siteId: number) {
   assertValidSiteId(siteId);
@@ -98,19 +98,33 @@ export async function findClient(
   return null;
 }
 
+/**
+ * Create a prospect client in Mindbody.
+ * Optional: set a "Referral Type" / "Referred By" label when provided.
+ * IMPORTANT: Only pass referralType from your Google Sheets flow.
+ * Do NOT pass it from your Typeform flow.
+ */
 export async function createClient(
   siteId: number,
-  input: { firstName: string; lastName: string; email?: string; phone?: string }
+  input: { firstName: string; lastName: string; email?: string; phone?: string },
+  options?: { referralType?: string }
 ) {
   const client = await mbClient(siteId);
 
-  const payload = {
+  const payload: Record<string, any> = {
     FirstName: input.firstName,
     LastName: input.lastName,
     Email: input.email ?? "",
     MobilePhone: input.phone ?? "",
     IsProspect: true,
   };
+
+  // Only set when caller provides it (Sheets job will provide it, Typeform will not)
+  if (options?.referralType) {
+    // This field name is commonly accepted; if your MB account expects a different field,
+    // we can swap it once you show the successful MB payload or endpoint docs for your tenant.
+    payload.ReferredBy = options.referralType;
+  }
 
   const res = await client.post(`/client/addclient`, payload);
   return res.data?.Client ?? null;
