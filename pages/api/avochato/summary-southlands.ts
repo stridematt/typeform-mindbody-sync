@@ -374,7 +374,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const body = req.body || {};
-    const siteId = Number(mustEnv("MINDBODY_SITE_ID_HB"));
+    const siteId = Number(mustEnv("MINDBODY_SITE_ID_SOUTHLANDS"));
 
     // Debug: confirm extraction in logs
     const extractedClientId = getMindbodyClientIdFromAvochato(body);
