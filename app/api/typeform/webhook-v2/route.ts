@@ -339,6 +339,7 @@ export async function POST(req: Request) {
   await ensureTables();
 
   const mapping = await getStudioMapping(lead.studioName);
+  console.log("studio mapping result:", mapping);
 
   if (!mapping || mapping.is_active === false) {
     return NextResponse.json({
@@ -359,6 +360,12 @@ export async function POST(req: Request) {
       insert into processed_submissions_v2 (typeform_token, form_id, studio_name, site_id)
       values (${lead.token}, ${lead.formId ?? null}, ${lead.studioName}, ${siteId})
     `;
+
+    console.log("inserted processed submission", {
+      token: lead.token,
+      studioName: lead.studioName,
+      siteId
+    });
   } catch {
     return NextResponse.json({
       ok: true,
@@ -376,6 +383,15 @@ export async function POST(req: Request) {
 
   const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
 
+  console.log("about to search/create in MB", {
+    siteId,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: normalizedEmail,
+    phone: normalizedPhone,
+    coach: lead.coach
+  });
+
   try {
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
@@ -383,6 +399,8 @@ export async function POST(req: Request) {
       email: normalizedEmail,
       phone: normalizedPhone
     });
+
+    console.log("existing MB client result:", existing);
 
     if (existing?.Id) {
       return NextResponse.json({
@@ -405,6 +423,8 @@ export async function POST(req: Request) {
       phone: normalizedPhone
     });
 
+    console.log("created MB client result:", created);
+
     if (!created?.Id) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
     }
@@ -424,6 +444,12 @@ export async function POST(req: Request) {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
     const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
+    console.log("mindbody error:", {
+      status,
+      where,
+      data
+    });
 
     return NextResponse.json(
       {
