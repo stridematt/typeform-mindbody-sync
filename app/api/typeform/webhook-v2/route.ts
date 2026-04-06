@@ -242,171 +242,208 @@ async function getStudioMapping(studioName: string) {
 }
 
 export async function POST(req: Request) {
-  console.log("🔥 webhook-v2 hit");
-
-  const rawBody = await req.text();
-  console.log("raw body length:", rawBody.length);
-
-  const verification = await verifyTypeform(req, rawBody);
-  console.log("verification result:", verification);
-
-  if (!verification.ok) {
-    return NextResponse.json(
-      { ok: false, error: "Unauthorized (Typeform verification failed)" },
-      { status: 401 }
-    );
-  }
-
-  let payload: any;
   try {
-    payload = JSON.parse(rawBody);
-    console.log("payload parsed successfully");
-  } catch {
-    return NextResponse.json({ ok: false, error: "Invalid JSON" }, { status: 400 });
-  }
-
-  const lead = extractLead(payload);
-
-  console.log("lead extracted:", {
-    formId: lead.formId,
-    token: lead.token,
-    firstName: lead.firstName,
-    lastName: lead.lastName,
-    email: lead.email,
-    phone: lead.phone,
-    studioName: lead.studioName,
-    coach: lead.coach,
-    answersCount: lead.answersCount
-  });
-
-  if (!lead.formId || !lead.token || lead.answersCount === 0) {
-    return NextResponse.json({ ok: true, status: "typeform_test_ok" });
-  }
-
-  if (!lead.firstName || !lead.lastName) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing firstName or lastName from Typeform payload",
-        extracted: {
-          firstName: lead.firstName,
-          lastName: lead.lastName,
-          email: lead.email,
-          phone: lead.phone,
-          studioName: lead.studioName,
-          coach: lead.coach
-        }
-      },
-      { status: 400 }
-    );
-  }
-
-  if (!lead.studioName) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing studioName from Typeform payload",
-        extracted: {
-          firstName: lead.firstName,
-          lastName: lead.lastName,
-          email: lead.email,
-          phone: lead.phone,
-          coach: lead.coach
-        }
-      },
-      { status: 400 }
-    );
-  }
-
-  if (!lead.coach) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Missing coach from Typeform payload",
-        extracted: {
-          firstName: lead.firstName,
-          lastName: lead.lastName,
-          email: lead.email,
-          phone: lead.phone,
-          studioName: lead.studioName,
-          coach: lead.coach
-        }
-      },
-      { status: 400 }
-    );
-  }
-
-  await ensureTables();
-
-  const mapping = await getStudioMapping(lead.studioName);
-  console.log("studio mapping result:", mapping);
-
-  if (!mapping || mapping.is_active === false) {
-    return NextResponse.json({
-      ok: true,
-      status: "routed",
-      routedTo: null,
-      message: "No active site mapping for this studio",
-      studioName: lead.studioName,
-      studioKey: slugifyStudioName(lead.studioName),
-      coach: lead.coach
+    console.log("🔥 webhook-v2 hit");
+    console.log("env check:", {
+      hasDatabaseUrlV2: !!process.env.DATABASE_URL_V2,
+      hasDatabaseUrl: !!process.env.DATABASE_URL,
+      hasTypeformSecret: !!process.env.TYPEFORM_WEBHOOK_SECRET,
+      nodeEnv: process.env.NODE_ENV
     });
-  }
 
-  const siteId = Number(mapping.site_id);
+    const rawBody = await req.text();
+    console.log("raw body length:", rawBody.length);
 
-  try {
-    await sql`
-      insert into processed_submissions_v2 (typeform_token, form_id, studio_name, site_id)
-      values (${lead.token}, ${lead.formId ?? null}, ${lead.studioName}, ${siteId})
-    `;
+    const verification = await verifyTypeform(req, rawBody);
+    console.log("verification result:", verification);
 
-    console.log("inserted processed submission", {
+    if (!verification.ok) {
+      return NextResponse.json(
+        { ok: false, error: "Unauthorized (Typeform verification failed)" },
+        { status: 401 }
+      );
+    }
+
+    let payload: any;
+    try {
+      payload = JSON.parse(rawBody);
+      console.log("payload parsed successfully");
+    } catch (parseErr) {
+      console.log("payload parse failed:", parseErr);
+      return NextResponse.json({ ok: false, error: "Invalid JSON" }, { status: 400 });
+    }
+
+    const lead = extractLead(payload);
+
+    console.log("lead extracted:", {
+      formId: lead.formId,
       token: lead.token,
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+      email: lead.email,
+      phone: lead.phone,
       studioName: lead.studioName,
-      siteId
+      coach: lead.coach,
+      answersCount: lead.answersCount
     });
-  } catch {
-    return NextResponse.json({
-      ok: true,
-      status: "deduped",
-      routedTo: { studioName: mapping.studio_name, siteId },
-      coach: lead.coach
-    });
-  }
 
-  const normalizedEmail =
-    lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
+    if (!lead.formId || !lead.token || lead.answersCount === 0) {
+      return NextResponse.json({ ok: true, status: "typeform_test_ok" });
+    }
 
-  const normalizedPhoneRaw =
-    lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
+    if (!lead.firstName || !lead.lastName) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Missing firstName or lastName from Typeform payload",
+          extracted: {
+            firstName: lead.firstName,
+            lastName: lead.lastName,
+            email: lead.email,
+            phone: lead.phone,
+            studioName: lead.studioName,
+            coach: lead.coach
+          }
+        },
+        { status: 400 }
+      );
+    }
 
-  const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
+    if (!lead.studioName) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Missing studioName from Typeform payload",
+          extracted: {
+            firstName: lead.firstName,
+            lastName: lead.lastName,
+            email: lead.email,
+            phone: lead.phone,
+            coach: lead.coach
+          }
+        },
+        { status: 400 }
+      );
+    }
 
-  console.log("about to search/create in MB", {
-    siteId,
-    firstName: lead.firstName,
-    lastName: lead.lastName,
-    email: normalizedEmail,
-    phone: normalizedPhone,
-    coach: lead.coach
-  });
+    if (!lead.coach) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Missing coach from Typeform payload",
+          extracted: {
+            firstName: lead.firstName,
+            lastName: lead.lastName,
+            email: lead.email,
+            phone: lead.phone,
+            studioName: lead.studioName,
+            coach: lead.coach
+          }
+        },
+        { status: 400 }
+      );
+    }
 
-  try {
-    const existing = await findClient(siteId, {
+    console.log("before ensureTables");
+    await ensureTables();
+    console.log("after ensureTables");
+
+    const mapping = await getStudioMapping(lead.studioName);
+    console.log("studio mapping result:", mapping);
+
+    if (!mapping || mapping.is_active === false) {
+      return NextResponse.json({
+        ok: true,
+        status: "routed",
+        routedTo: null,
+        message: "No active site mapping for this studio",
+        studioName: lead.studioName,
+        studioKey: slugifyStudioName(lead.studioName),
+        coach: lead.coach
+      });
+    }
+
+    const siteId = Number(mapping.site_id);
+
+    try {
+      await sql`
+        insert into processed_submissions_v2 (typeform_token, form_id, studio_name, site_id)
+        values (${lead.token}, ${lead.formId ?? null}, ${lead.studioName}, ${siteId})
+      `;
+
+      console.log("inserted processed submission", {
+        token: lead.token,
+        studioName: lead.studioName,
+        siteId
+      });
+    } catch (insertErr) {
+      console.log("processed submission insert failed, likely deduped:", insertErr);
+      return NextResponse.json({
+        ok: true,
+        status: "deduped",
+        routedTo: { studioName: mapping.studio_name, siteId },
+        coach: lead.coach
+      });
+    }
+
+    const normalizedEmail =
+      lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
+
+    const normalizedPhoneRaw =
+      lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
+
+    const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
+
+    console.log("about to search/create in MB", {
+      siteId,
       firstName: lead.firstName,
       lastName: lead.lastName,
       email: normalizedEmail,
-      phone: normalizedPhone
+      phone: normalizedPhone,
+      coach: lead.coach
     });
 
-    console.log("existing MB client result:", existing);
+    try {
+      const existing = await findClient(siteId, {
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        email: normalizedEmail,
+        phone: normalizedPhone
+      });
 
-    if (existing?.Id) {
+      console.log("existing MB client result:", existing);
+
+      if (existing?.Id) {
+        return NextResponse.json({
+          ok: true,
+          status: "exists",
+          mbClientId: String(existing.Id),
+          routedTo: { studioName: mapping.studio_name, siteId },
+          coach: lead.coach,
+          fallbacksUsed: {
+            emailWasFallback: !lead.email,
+            phoneWasFallback: !lead.phone
+          }
+        });
+      }
+
+      const created = await createClient(siteId, {
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        email: normalizedEmail,
+        phone: normalizedPhone
+      });
+
+      console.log("created MB client result:", created);
+
+      if (!created?.Id) {
+        return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
+      }
+
       return NextResponse.json({
         ok: true,
-        status: "exists",
-        mbClientId: String(existing.Id),
+        status: "created",
+        mbClientId: String(created.Id),
         routedTo: { studioName: mapping.studio_name, siteId },
         coach: lead.coach,
         fallbacksUsed: {
@@ -414,50 +451,38 @@ export async function POST(req: Request) {
           phoneWasFallback: !lead.phone
         }
       });
+    } catch (err: any) {
+      const status = err?.response?.status ?? null;
+      const data = err?.response?.data ?? null;
+      const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
+      console.log("mindbody error:", {
+        status,
+        where,
+        data
+      });
+
+      return NextResponse.json(
+        {
+          ok: false,
+          error: err?.message ?? "Server error",
+          mindbody: { status, where, data },
+          routedTo: { studioName: mapping.studio_name, siteId },
+          coach: lead.coach
+        },
+        { status: 500 }
+      );
     }
-
-    const created = await createClient(siteId, {
-      firstName: lead.firstName,
-      lastName: lead.lastName,
-      email: normalizedEmail,
-      phone: normalizedPhone
-    });
-
-    console.log("created MB client result:", created);
-
-    if (!created?.Id) {
-      return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
-    }
-
-    return NextResponse.json({
-      ok: true,
-      status: "created",
-      mbClientId: String(created.Id),
-      routedTo: { studioName: mapping.studio_name, siteId },
-      coach: lead.coach,
-      fallbacksUsed: {
-        emailWasFallback: !lead.email,
-        phoneWasFallback: !lead.phone
-      }
-    });
   } catch (err: any) {
-    const status = err?.response?.status ?? null;
-    const data = err?.response?.data ?? null;
-    const where = typeof err?.config?.url === "string" ? err.config.url : null;
-
-    console.log("mindbody error:", {
-      status,
-      where,
-      data
+    console.log("top-level webhook-v2 error:", {
+      message: err?.message,
+      stack: err?.stack
     });
 
     return NextResponse.json(
       {
         ok: false,
-        error: err?.message ?? "Server error",
-        mindbody: { status, where, data },
-        routedTo: { studioName: mapping.studio_name, siteId },
-        coach: lead.coach
+        error: err?.message ?? "Unhandled server error"
       },
       { status: 500 }
     );
