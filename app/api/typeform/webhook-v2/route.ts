@@ -134,7 +134,11 @@ function extractLead(payload: any) {
   let lastName = (getByRefList(["last_name", "lastname", "last-name"]) ?? "").toString().trim();
   let email = getByRefList(["email", "email_address", "email-address"]);
   let phone = getByRefList(["phone", "phone_number", "phone-number", "mobile"]);
-  let studioName = getByRefList([
+const hidden = payload?.form_response?.hidden ?? {};
+
+let studioName =
+  hidden.studio ||
+  getByRefList([
     "studio",
     "studio_name",
     "studio-name",
