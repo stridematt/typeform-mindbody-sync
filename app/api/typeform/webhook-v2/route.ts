@@ -398,18 +398,12 @@ export async function POST(req: Request) {
       });
     }
 
-    const created = await createClient(
-      siteId,
-      {
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        email: normalizedEmail,
-        phone: normalizedPhone
-      },
-      {
-        coach: lead.coach
-      }
-    );
+    const created = await createClient(siteId, {
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+      email: normalizedEmail,
+      phone: normalizedPhone
+    });
 
     if (!created?.Id) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
