@@ -221,9 +221,14 @@ async function getStudioMapping(studioName: string) {
 }
 
 export async function POST(req: Request) {
+  console.log("🔥 webhook-v2 hit");
+
   const rawBody = await req.text();
+  console.log("raw body length:", rawBody.length);
 
   const verification = await verifyTypeform(req, rawBody);
+  console.log("verification result:", verification);
+
   if (!verification.ok) {
     return NextResponse.json(
       { ok: false, error: "Unauthorized (Typeform verification failed)" },
