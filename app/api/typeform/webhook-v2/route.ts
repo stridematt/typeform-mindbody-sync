@@ -90,6 +90,7 @@ function getAnswerValue(answer: any) {
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
+  const hidden = payload?.form_response?.hidden ?? {};
 
   const answers: any[] = payload?.form_response?.answers ?? [];
   const fields: any[] = payload?.form_response?.definition?.fields ?? [];
@@ -134,20 +135,28 @@ function extractLead(payload: any) {
   let lastName = (getByRefList(["last_name", "lastname", "last-name"]) ?? "").toString().trim();
   let email = getByRefList(["email", "email_address", "email-address"]);
   let phone = getByRefList(["phone", "phone_number", "phone-number", "mobile"]);
-const hidden = payload?.form_response?.hidden ?? {};
 
-let studioName =
-  hidden.studio ||
-  getByRefList([
-    "studio",
-    "studio_name",
-    "studio-name",
-    "location",
-    "location_name",
-    "location-name",
-    "home_studio",
-    "home-studio"
-  ]);
+  let studioName =
+    hidden.studio ||
+    getByRefList([
+      "studio",
+      "studio_name",
+      "studio-name",
+      "location",
+      "location_name",
+      "location-name",
+      "home_studio",
+      "home-studio"
+    ]);
+
+  const coach =
+    hidden.coach ||
+    getByRefList([
+      "coach",
+      "coach_name",
+      "coach-name"
+    ]) ||
+    null;
 
   if (!firstName) {
     firstName = findByTitleIncludes(["first name", "firstname"]) ?? "";
@@ -168,7 +177,14 @@ let studioName =
   }
 
   if (!studioName) {
-    studioName = findByTitleIncludes(["studio", "location", "home studio"]);
+    studioName = findByTitleIncludes([
+      "studio",
+      "location",
+      "home studio",
+      "which studio",
+      "select studio",
+      "choose studio"
+    ]);
   }
 
   return {
@@ -179,13 +195,14 @@ let studioName =
     email,
     phone,
     studioName,
+    coach,
     answersCount: answers.length
   };
 }
 
 async function ensureTables() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL.");
+  if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
+    throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
   }
 
   await sql`
@@ -243,11 +260,24 @@ export async function POST(req: Request) {
   let payload: any;
   try {
     payload = JSON.parse(rawBody);
+    console.log("payload parsed successfully");
   } catch {
     return NextResponse.json({ ok: false, error: "Invalid JSON" }, { status: 400 });
   }
 
   const lead = extractLead(payload);
+
+  console.log("lead extracted:", {
+    formId: lead.formId,
+    token: lead.token,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: lead.email,
+    phone: lead.phone,
+    studioName: lead.studioName,
+    coach: lead.coach,
+    answersCount: lead.answersCount
+  });
 
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
     return NextResponse.json({ ok: true, status: "typeform_test_ok" });
@@ -263,7 +293,8 @@ export async function POST(req: Request) {
           lastName: lead.lastName,
           email: lead.email,
           phone: lead.phone,
-          studioName: lead.studioName
+          studioName: lead.studioName,
+          coach: lead.coach
         }
       },
       { status: 400 }
@@ -279,7 +310,26 @@ export async function POST(req: Request) {
           firstName: lead.firstName,
           lastName: lead.lastName,
           email: lead.email,
-          phone: lead.phone
+          phone: lead.phone,
+          coach: lead.coach
+        }
+      },
+      { status: 400 }
+    );
+  }
+
+  if (!lead.coach) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Missing coach from Typeform payload",
+        extracted: {
+          firstName: lead.firstName,
+          lastName: lead.lastName,
+          email: lead.email,
+          phone: lead.phone,
+          studioName: lead.studioName,
+          coach: lead.coach
         }
       },
       { status: 400 }
@@ -297,7 +347,8 @@ export async function POST(req: Request) {
       routedTo: null,
       message: "No active site mapping for this studio",
       studioName: lead.studioName,
-      studioKey: slugifyStudioName(lead.studioName)
+      studioKey: slugifyStudioName(lead.studioName),
+      coach: lead.coach
     });
   }
 
@@ -312,7 +363,8 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true,
       status: "deduped",
-      routedTo: { studioName: mapping.studio_name, siteId }
+      routedTo: { studioName: mapping.studio_name, siteId },
+      coach: lead.coach
     });
   }
 
@@ -338,6 +390,7 @@ export async function POST(req: Request) {
         status: "exists",
         mbClientId: String(existing.Id),
         routedTo: { studioName: mapping.studio_name, siteId },
+        coach: lead.coach,
         fallbacksUsed: {
           emailWasFallback: !lead.email,
           phoneWasFallback: !lead.phone
@@ -345,12 +398,18 @@ export async function POST(req: Request) {
       });
     }
 
-    const created = await createClient(siteId, {
-      firstName: lead.firstName,
-      lastName: lead.lastName,
-      email: normalizedEmail,
-      phone: normalizedPhone
-    });
+    const created = await createClient(
+      siteId,
+      {
+        firstName: lead.firstName,
+        lastName: lead.lastName,
+        email: normalizedEmail,
+        phone: normalizedPhone
+      },
+      {
+        coach: lead.coach
+      }
+    );
 
     if (!created?.Id) {
       return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
@@ -361,6 +420,7 @@ export async function POST(req: Request) {
       status: "created",
       mbClientId: String(created.Id),
       routedTo: { studioName: mapping.studio_name, siteId },
+      coach: lead.coach,
       fallbacksUsed: {
         emailWasFallback: !lead.email,
         phoneWasFallback: !lead.phone
@@ -376,7 +436,8 @@ export async function POST(req: Request) {
         ok: false,
         error: err?.message ?? "Server error",
         mindbody: { status, where, data },
-        routedTo: { studioName: mapping.studio_name, siteId }
+        routedTo: { studioName: mapping.studio_name, siteId },
+        coach: lead.coach
       },
       { status: 500 }
     );
