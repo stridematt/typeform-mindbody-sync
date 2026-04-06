@@ -5,7 +5,9 @@ import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
-const sql = neon(process.env.DATABASE_URL || "");
+const sql = neon(
+  process.env.DATABASE_URL_V2 || process.env.DATABASE_URL || ""
+);
 
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
