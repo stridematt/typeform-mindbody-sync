@@ -149,9 +149,24 @@ function extractLead(payload: any) {
       "home-studio"
     ]);
 
-  const coach =
+  const attributionType =
+    hidden.affiliate
+      ? "affiliate"
+      : hidden.coach
+        ? "coach"
+        : getByRefList(["affiliate", "affiliate_name", "affiliate-name"])
+          ? "affiliate"
+          : getByRefList(["coach", "coach_name", "coach-name"])
+            ? "coach"
+            : null;
+
+  const attribution =
+    hidden.affiliate ||
     hidden.coach ||
     getByRefList([
+      "affiliate",
+      "affiliate_name",
+      "affiliate-name",
       "coach",
       "coach_name",
       "coach-name"
@@ -195,7 +210,8 @@ function extractLead(payload: any) {
     email,
     phone,
     studioName,
-    coach,
+    attribution,
+    attributionType,
     answersCount: answers.length
   };
 }
@@ -223,9 +239,25 @@ async function ensureTables() {
       form_id text,
       studio_name text,
       site_id integer,
+      attribution text,
+      attribution_type text,
       created_at timestamptz default now()
     );
   `;
+
+  try {
+    await sql`
+      alter table processed_submissions_v2
+      add column if not exists attribution text
+    `;
+  } catch {}
+
+  try {
+    await sql`
+      alter table processed_submissions_v2
+      add column if not exists attribution_type text
+    `;
+  } catch {}
 }
 
 async function getStudioMapping(studioName: string) {
@@ -283,7 +315,8 @@ export async function POST(req: Request) {
       email: lead.email,
       phone: lead.phone,
       studioName: lead.studioName,
-      coach: lead.coach,
+      attribution: lead.attribution,
+      attributionType: lead.attributionType,
       answersCount: lead.answersCount
     });
 
@@ -302,7 +335,8 @@ export async function POST(req: Request) {
             email: lead.email,
             phone: lead.phone,
             studioName: lead.studioName,
-            coach: lead.coach
+            attribution: lead.attribution,
+            attributionType: lead.attributionType
           }
         },
         { status: 400 }
@@ -319,25 +353,27 @@ export async function POST(req: Request) {
             lastName: lead.lastName,
             email: lead.email,
             phone: lead.phone,
-            coach: lead.coach
+            attribution: lead.attribution,
+            attributionType: lead.attributionType
           }
         },
         { status: 400 }
       );
     }
 
-    if (!lead.coach) {
+    if (!lead.attribution) {
       return NextResponse.json(
         {
           ok: false,
-          error: "Missing coach from Typeform payload",
+          error: "Missing attribution from Typeform payload",
           extracted: {
             firstName: lead.firstName,
             lastName: lead.lastName,
             email: lead.email,
             phone: lead.phone,
             studioName: lead.studioName,
-            coach: lead.coach
+            attribution: lead.attribution,
+            attributionType: lead.attributionType
           }
         },
         { status: 400 }
@@ -359,7 +395,8 @@ export async function POST(req: Request) {
         message: "No active site mapping for this studio",
         studioName: lead.studioName,
         studioKey: slugifyStudioName(lead.studioName),
-        coach: lead.coach
+        attribution: lead.attribution,
+        attributionType: lead.attributionType
       });
     }
 
@@ -367,14 +404,30 @@ export async function POST(req: Request) {
 
     try {
       await sql`
-        insert into processed_submissions_v2 (typeform_token, form_id, studio_name, site_id)
-        values (${lead.token}, ${lead.formId ?? null}, ${lead.studioName}, ${siteId})
+        insert into processed_submissions_v2 (
+          typeform_token,
+          form_id,
+          studio_name,
+          site_id,
+          attribution,
+          attribution_type
+        )
+        values (
+          ${lead.token},
+          ${lead.formId ?? null},
+          ${lead.studioName},
+          ${siteId},
+          ${lead.attribution},
+          ${lead.attributionType}
+        )
       `;
 
       console.log("inserted processed submission", {
         token: lead.token,
         studioName: lead.studioName,
-        siteId
+        siteId,
+        attribution: lead.attribution,
+        attributionType: lead.attributionType
       });
     } catch (insertErr) {
       console.log("processed submission insert failed, likely deduped:", insertErr);
@@ -382,7 +435,8 @@ export async function POST(req: Request) {
         ok: true,
         status: "deduped",
         routedTo: { studioName: mapping.studio_name, siteId },
-        coach: lead.coach
+        attribution: lead.attribution,
+        attributionType: lead.attributionType
       });
     }
 
@@ -400,7 +454,8 @@ export async function POST(req: Request) {
       lastName: lead.lastName,
       email: normalizedEmail,
       phone: normalizedPhone,
-      coach: lead.coach
+      attribution: lead.attribution,
+      attributionType: lead.attributionType
     });
 
     try {
@@ -419,7 +474,8 @@ export async function POST(req: Request) {
           status: "exists",
           mbClientId: String(existing.Id),
           routedTo: { studioName: mapping.studio_name, siteId },
-          coach: lead.coach,
+          attribution: lead.attribution,
+          attributionType: lead.attributionType,
           fallbacksUsed: {
             emailWasFallback: !lead.email,
             phoneWasFallback: !lead.phone
@@ -445,7 +501,8 @@ export async function POST(req: Request) {
         status: "created",
         mbClientId: String(created.Id),
         routedTo: { studioName: mapping.studio_name, siteId },
-        coach: lead.coach,
+        attribution: lead.attribution,
+        attributionType: lead.attributionType,
         fallbacksUsed: {
           emailWasFallback: !lead.email,
           phoneWasFallback: !lead.phone
@@ -468,7 +525,8 @@ export async function POST(req: Request) {
           error: err?.message ?? "Server error",
           mindbody: { status, where, data },
           routedTo: { studioName: mapping.studio_name, siteId },
-          coach: lead.coach
+          attribution: lead.attribution,
+          attributionType: lead.attributionType
         },
         { status: 500 }
       );
