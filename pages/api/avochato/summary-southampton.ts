@@ -1,12 +1,6 @@
-// /pages/api/avochato/summary-southampton.ts
+// /pages/api/avochato/summary.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "crypto";
-
-/* =========================
-   Studio config
-========================= */
-
-const STUDIO = "SOUTHAMPTON";
 
 /* =========================
    Utilities
@@ -15,13 +9,6 @@ const STUDIO = "SOUTHAMPTON";
 function mustEnv(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ${name}`);
-  return v;
-}
-
-/** Returns the studio-specific env var if set, else the shared fallback. Throws if neither exists. */
-function studioEnv(specificName: string, fallbackName: string): string {
-  const v = process.env[specificName] ?? process.env[fallbackName];
-  if (!v) throw new Error(`Missing ${specificName} (and fallback ${fallbackName})`);
   return v;
 }
 
@@ -294,7 +281,7 @@ async function mindbodyFindClientIdByPhone(params: { siteId: number; phoneKey10:
     const xml = await mindbodySoapGetClients({ siteId: params.siteId, searchText });
     const clients = extractClientsFromSoap(xml);
 
-    console.log(`[${STUDIO}] SOAP searchText:`, searchText, "clientsReturned:", clients.length);
+    console.log("SOAP searchText:", searchText, "clientsReturned:", clients.length);
 
     const hit = clients.find((c) => {
       const phones = [c.mobilePhone, c.homePhone, c.workPhone].map((p) => last10Digits(p));
@@ -313,8 +300,8 @@ async function mindbodyFindClientIdByPhone(params: { siteId: number; phoneKey10:
 
 async function mindbodyIssueUserToken(siteId: number): Promise<string> {
   const apiKey = mustEnv("MINDBODY_API_KEY");
-  const username = studioEnv(`MINDBODY_STAFF_USERNAME_${STUDIO}`, "MINDBODY_STAFF_USERNAME");
-  const password = studioEnv(`MINDBODY_STAFF_PASSWORD_${STUDIO}`, "MINDBODY_STAFF_PASSWORD");
+  const username = mustEnv("MINDBODY_STAFF_USERNAME");
+  const password = mustEnv("MINDBODY_STAFF_PASSWORD");
 
   const r = await fetch("https://api.mindbodyonline.com/public/v6/usertoken/issue", {
     method: "POST",
@@ -339,9 +326,7 @@ async function mindbodyAddContactLog(params: {
   text: string;
 }): Promise<any> {
   const apiKey = mustEnv("MINDBODY_API_KEY");
-  const typeId = Number(
-    studioEnv(`MINDBODY_CONTACT_LOG_TYPE_ID_${STUDIO}`, "MINDBODY_CONTACT_LOG_TYPE_ID")
-  );
+  const typeId = Number(mustEnv("MINDBODY_CONTACT_LOG_TYPE_ID"));
 
   // Mindbody expects PascalCase and specifically ClientId
   const payload = {
@@ -389,11 +374,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const body = req.body || {};
-    const siteId = Number(mustEnv(`MINDBODY_SITE_ID_${STUDIO}`));
+    const siteId = Number(mustEnv("MINDBODY_SITE_ID_SOUTHAMPTON"));
 
     // Debug: confirm extraction in logs
     const extractedClientId = getMindbodyClientIdFromAvochato(body);
-    console.log(`[${STUDIO}] Extracted mindbodyClientId:`, extractedClientId);
+    console.log("Extracted mindbodyClientId:", extractedClientId);
 
     const contactName = getContactName(body);
     const logText = buildContactLogText(body);
@@ -411,7 +396,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       const fullDigits = digitsOnly(mobile.raw || "");
-      console.log(`[${STUDIO}] Fallback phone raw:`, mobile.raw, "phoneKey10:", mobile.key10, "fullDigits:", fullDigits);
+      console.log("Fallback phone raw:", mobile.raw, "phoneKey10:", mobile.key10, "fullDigits:", fullDigits);
 
       clientId = await mindbodyFindClientIdByPhone({
         siteId,
@@ -424,7 +409,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           ok: true,
           message: "Webhook received but client not found",
           phone: mobile.key10,
-          studio: STUDIO,
         });
       }
     }
@@ -439,9 +423,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       text: logText,
     });
 
-    return res.status(200).json({ ok: true, studio: STUDIO, clientId, mindbody: mbResp });
+    return res.status(200).json({ ok: true, clientId, mindbody: mbResp });
   } catch (err: any) {
-    console.error(`[${STUDIO}]`, err);
+    console.error(err);
     return res.status(500).json({ error: err?.message || "Server error" });
   }
 }
