@@ -17,6 +17,15 @@ export async function POST(req: Request) {
     const email = body.lead?.email;
     const phone = body.lead?.phone;
 
+    // Optional per-row referral type from the Sheet (e.g. column I in HB).
+    // Falls back to "Paid Lead" so existing callers that don't send this
+    // field keep the same behavior.
+    const referralTypeRaw = body.lead?.referralType;
+    const referralType =
+      typeof referralTypeRaw === "string" && referralTypeRaw.trim()
+        ? referralTypeRaw.trim()
+        : "Paid Lead";
+
     if (!sheetId || !sheetName || !rowNumber) {
       return NextResponse.json(
         { ok: false, error: "Missing sheetId, sheetName, or rowNumber" },
@@ -76,13 +85,11 @@ export async function POST(req: Request) {
       }
 
       // Row was marked processed but no client exists in Mindbody.
-      // This is the failure case the backfill is trying to recover from:
-      // the dedupe row got written but the Mindbody create never happened
-      // (or was rolled back). Create the client now.
+      // Recreate using the per-row referralType.
       const created = await createClient(
         siteId,
         { firstName, lastName, email, phone },
-        { referralType: "Paid Lead" }
+        { referralType }
       );
 
       return NextResponse.json({
@@ -110,11 +117,12 @@ export async function POST(req: Request) {
     }
 
     // create in Mindbody
-    // IMPORTANT: referralType is ONLY applied here (Google Sheets flow)
+    // referralType is applied here (Google Sheets flow).
+    // Per-row override from body.lead.referralType, falling back to "Paid Lead".
     const created = await createClient(
       siteId,
       { firstName, lastName, email, phone },
-      { referralType: "Paid Lead" }
+      { referralType }
     );
 
     return NextResponse.json({
