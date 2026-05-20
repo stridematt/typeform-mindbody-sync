@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { neon } from "@neondatabase/serverless";
-import { findClient, createClient, addContactLog } from "../../../../lib/mindbody";
+import { findClient, createClient, addContactLog, updateClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
@@ -46,6 +46,16 @@ export async function POST(req: Request) {
     // Optional: when true, the webhook will create a Contact Log
     // immediately after the client is created.
     const createFollowupTask = body.lead?.createFollowupTask === true;
+
+    // Optional: name of a Sales Pipeline stage to move the new lead into.
+    // Per Mindbody docs, on Ultimate-tier accounts UpdateClient can place
+    // a lead into a stage when IsProspect=true and ProspectStage.Description
+    // are set. We fire this as a follow-up call after AddClient succeeds.
+    const prospectStageRaw = body.lead?.prospectStage;
+    const prospectStage =
+      typeof prospectStageRaw === "string" && prospectStageRaw.trim()
+        ? prospectStageRaw.trim()
+        : undefined;
 
     if (!sheetId || !sheetName || !rowNumber) {
       return NextResponse.json(
@@ -109,6 +119,29 @@ export async function POST(req: Request) {
       }
     };
 
+    // Helper: best-effort Sales Pipeline stage placement via UpdateClient.
+    // Ultimate-tier-only per Mindbody docs. Whether custom stage names
+    // (e.g. "Call Center") work vs only default names ("New Lead") is
+    // untested — the response will tell us.
+    const maybeMoveToProspectStage = async (
+      mbClientId: string | number | null | undefined
+    ) => {
+      if (!prospectStage) return null;
+      if (!mbClientId) return null;
+      try {
+        const updateResult = await updateClient(siteId, mbClientId, {
+          prospectStageDescription: prospectStage,
+        });
+        return { ok: true, response: updateResult };
+      } catch (err: any) {
+        const detail =
+          err?.response?.data ??
+          err?.message ??
+          String(err);
+        return { ok: false, error: detail };
+      }
+    };
+
     if (alreadyProcessed) {
       const existing = await findClient(siteId, {
         firstName,
@@ -135,12 +168,14 @@ export async function POST(req: Request) {
 
       const mbClientId = created?.Id ? String(created.Id) : null;
       const followup = await maybeCreateFollowupTask(mbClientId);
+      const stageMove = await maybeMoveToProspectStage(mbClientId);
 
       return NextResponse.json({
         ok: true,
         status: "deduped-recreated",
         mbClientId,
         followupTask: followup,
+        stageMove,
         routedTo: { locationName: tenant.location_name, siteId }
       });
     }
@@ -168,12 +203,14 @@ export async function POST(req: Request) {
 
     const mbClientId = created?.Id ? String(created.Id) : null;
     const followup = await maybeCreateFollowupTask(mbClientId);
+    const stageMove = await maybeMoveToProspectStage(mbClientId);
 
     return NextResponse.json({
       ok: true,
       status: "created",
       mbClientId,
       followupTask: followup,
+      stageMove,
       routedTo: { locationName: tenant.location_name, siteId }
     });
   } catch (error: any) {
