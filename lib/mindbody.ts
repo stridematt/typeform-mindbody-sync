@@ -97,10 +97,16 @@ export async function findClient(
 /**
  * Create a prospect client in Mindbody.
  * Optional: set a "Referral Type" / "Referred By" label when provided.
- * Optional: set a SalesRep (numeric Mindbody staff Id) when provided.
+ * Optional: assign a sales rep (Rep 1) by numeric Mindbody staff Id.
  *
  * IMPORTANT: Only pass referralType from your Google Sheets flow.
  * Do NOT pass it from your Typeform flow.
+ *
+ * NOTE on salesRep:
+ *   We send AssignedSalesReps (array) on AddClient, which is what the Mindbody
+ *   UI uses for Rep 1. A prior attempt with the singular `SalesRep` field was
+ *   silently dropped by this tenant. If this still doesn't stick, we'll need
+ *   to follow up with an explicit /client/updateclient call.
  */
 export async function createClient(
   siteId: number,
@@ -118,21 +124,47 @@ export async function createClient(
   };
 
   if (options?.referralType) {
-    // This field name is commonly accepted; if your MB account expects a different field,
-    // we can swap it once you show the successful MB payload or endpoint docs for your tenant.
     payload.ReferredBy = options.referralType;
   }
 
-  // SalesRep is the "Rep 1" assignment on the client profile.
-  // Mindbody Public API expects an integer staff Id (e.g. 100000053).
   if (
     options?.salesRep !== undefined &&
     options?.salesRep !== null &&
     Number.isFinite(options.salesRep)
   ) {
-    payload.SalesRep = Number(options.salesRep);
+    payload.AssignedSalesReps = [{ Id: Number(options.salesRep) }];
   }
 
   const res = await client.post(`/client/addclient`, payload);
+  return res.data?.Client ?? null;
+}
+
+/**
+ * Update an existing client. Used as a fallback to set the sales rep
+ * if AddClient silently drops the assignment.
+ */
+export async function updateClient(
+  siteId: number,
+  mbClientId: string | number,
+  updates: { salesRep?: number }
+) {
+  const client = await mbClient(siteId);
+
+  const clientPayload: Record<string, any> = {
+    Id: String(mbClientId),
+  };
+
+  if (
+    updates.salesRep !== undefined &&
+    updates.salesRep !== null &&
+    Number.isFinite(updates.salesRep)
+  ) {
+    clientPayload.AssignedSalesReps = [{ Id: Number(updates.salesRep) }];
+  }
+
+  const res = await client.post(`/client/updateclient`, {
+    Client: clientPayload,
+    CrossRegionalUpdate: false,
+  });
   return res.data?.Client ?? null;
 }
