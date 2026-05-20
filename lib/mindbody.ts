@@ -26,7 +26,6 @@ const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 async function getToken(siteId: number) {
   assertValidSiteId(siteId);
-
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const username = requireEnv("MINDBODY_USERNAME");
   const password = requireEnv("MINDBODY_PASSWORD");
@@ -60,7 +59,6 @@ async function getToken(siteId: number) {
 
 async function mbClient(siteId: number) {
   assertValidSiteId(siteId);
-
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const token = await getToken(siteId);
 
@@ -85,7 +83,6 @@ export async function findClient(
   const candidates: string[] = [];
   if (input.email) candidates.push(input.email);
   if (input.phone) candidates.push(input.phone);
-
   const fullName = `${input.firstName ?? ""} ${input.lastName ?? ""}`.trim();
   if (fullName) candidates.push(fullName);
 
@@ -94,20 +91,21 @@ export async function findClient(
     const found = res.data?.Clients?.[0];
     if (found?.Id) return found;
   }
-
   return null;
 }
 
 /**
  * Create a prospect client in Mindbody.
  * Optional: set a "Referral Type" / "Referred By" label when provided.
+ * Optional: set a SalesRep (numeric Mindbody staff Id) when provided.
+ *
  * IMPORTANT: Only pass referralType from your Google Sheets flow.
  * Do NOT pass it from your Typeform flow.
  */
 export async function createClient(
   siteId: number,
   input: { firstName: string; lastName: string; email?: string; phone?: string },
-  options?: { referralType?: string }
+  options?: { referralType?: string; salesRep?: number }
 ) {
   const client = await mbClient(siteId);
 
@@ -119,11 +117,20 @@ export async function createClient(
     IsProspect: true,
   };
 
-  // Only set when caller provides it (Sheets job will provide it, Typeform will not)
   if (options?.referralType) {
     // This field name is commonly accepted; if your MB account expects a different field,
     // we can swap it once you show the successful MB payload or endpoint docs for your tenant.
     payload.ReferredBy = options.referralType;
+  }
+
+  // SalesRep is the "Rep 1" assignment on the client profile.
+  // Mindbody Public API expects an integer staff Id (e.g. 100000053).
+  if (
+    options?.salesRep !== undefined &&
+    options?.salesRep !== null &&
+    Number.isFinite(options.salesRep)
+  ) {
+    payload.SalesRep = Number(options.salesRep);
   }
 
   const res = await client.post(`/client/addclient`, payload);
