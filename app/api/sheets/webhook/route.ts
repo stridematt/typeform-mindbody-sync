@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { neon } from "@neondatabase/serverless";
-import { findClient, createClient } from "../../../../lib/mindbody";
+import { findClient, createClient, addContactLog } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
@@ -17,18 +17,12 @@ export async function POST(req: Request) {
     const email = body.lead?.email;
     const phone = body.lead?.phone;
 
-    // Optional per-row referral type from the Sheet (e.g. column I in HB).
-    // Falls back to "Paid Lead" so existing callers that don't send this
-    // field keep the same behavior.
     const referralTypeRaw = body.lead?.referralType;
     const referralType =
       typeof referralTypeRaw === "string" && referralTypeRaw.trim()
         ? referralTypeRaw.trim()
         : "Paid Lead";
 
-    // Optional SalesRep (numeric Mindbody staff Id) from the Sheet payload.
-    // When provided this becomes the "Rep 1" on the created client profile.
-    // Not provided = behavior unchanged (no rep assigned by this code).
     const salesRepRaw = body.lead?.salesRep;
     const salesRepNum =
       salesRepRaw !== undefined && salesRepRaw !== null && salesRepRaw !== ""
@@ -38,6 +32,12 @@ export async function POST(req: Request) {
       salesRepNum !== undefined && Number.isFinite(salesRepNum)
         ? salesRepNum
         : undefined;
+
+    // Optional: when true, the webhook will create a Contact Log
+    // immediately after the client is created. The Set Trigger rule
+    // "Sales Followup Task created immediately after lead creation"
+    // should then move the lead into the configured stage.
+    const createFollowupTask = body.lead?.createFollowupTask === true;
 
     if (!sheetId || !sheetName || !rowNumber) {
       return NextResponse.json(
@@ -49,7 +49,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Missing name" }, { status: 400 });
     }
 
-    // find tenant
     const tenantRows = await sql`
       select sheet_id, location_name, site_id, is_active
       from sheet_tenants
@@ -65,11 +64,6 @@ export async function POST(req: Request) {
     }
     const siteId = Number(tenant.site_id);
 
-    // dedupe (sheet_id + sheet_name + row_number)
-    // If the row was already processed, look the client up in Mindbody and
-    // return their mbClientId so the Sheet can be backfilled. This covers
-    // the case where a previous run succeeded server-side but the response
-    // never made it back to the Sheet (or the Sheet write failed).
     let alreadyProcessed = false;
     try {
       await sql`
@@ -78,6 +72,31 @@ export async function POST(req: Request) {
       `;
     } catch {
       alreadyProcessed = true;
+    }
+
+    // Helper: best-effort follow-up task creation.
+    // Logs failures but does NOT fail the overall request — losing the
+    // stage placement is annoying but not as bad as losing the client.
+    async function maybeCreateFollowupTask(mbClientId: string | number | null | undefined) {
+      if (!createFollowupTask) return null;
+      if (!mbClientId) return null;
+      try {
+        const logResult = await addContactLog(siteId, {
+          clientId: mbClientId,
+          text: "Auto-created follow-up task from Paid Leads pipeline",
+          assignedToStaffId: salesRep, // assign the task to the same rep on the client
+          contactMethod: "Phone",
+          contactName: `${firstName} ${lastName}`.trim(),
+        });
+        return { ok: true, response: logResult };
+      } catch (err: any) {
+        // Mindbody errors here often have useful detail; bubble it up
+        const detail =
+          err?.response?.data ??
+          err?.message ??
+          String(err);
+        return { ok: false, error: detail };
+      }
     }
 
     if (alreadyProcessed) {
@@ -98,22 +117,24 @@ export async function POST(req: Request) {
       }
 
       // Row was marked processed but no client exists in Mindbody.
-      // Recreate using the per-row referralType and salesRep.
       const created = await createClient(
         siteId,
         { firstName, lastName, email, phone },
         { referralType, salesRep }
       );
 
+      const mbClientId = created?.Id ? String(created.Id) : null;
+      const followup = await maybeCreateFollowupTask(mbClientId);
+
       return NextResponse.json({
         ok: true,
         status: "deduped-recreated",
-        mbClientId: created?.Id ? String(created.Id) : null,
+        mbClientId,
+        followupTask: followup,
         routedTo: { locationName: tenant.location_name, siteId }
       });
     }
 
-    // find existing in Mindbody
     const existing = await findClient(siteId, {
       firstName,
       lastName,
@@ -129,18 +150,20 @@ export async function POST(req: Request) {
       });
     }
 
-    // create in Mindbody
-    // referralType and salesRep are applied here (Google Sheets flow).
     const created = await createClient(
       siteId,
       { firstName, lastName, email, phone },
       { referralType, salesRep }
     );
 
+    const mbClientId = created?.Id ? String(created.Id) : null;
+    const followup = await maybeCreateFollowupTask(mbClientId);
+
     return NextResponse.json({
       ok: true,
       status: "created",
-      mbClientId: created?.Id ? String(created.Id) : null,
+      mbClientId,
+      followupTask: followup,
       routedTo: { locationName: tenant.location_name, siteId }
     });
   } catch (error: any) {
