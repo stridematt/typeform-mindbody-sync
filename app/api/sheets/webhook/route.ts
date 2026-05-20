@@ -26,6 +26,19 @@ export async function POST(req: Request) {
         ? referralTypeRaw.trim()
         : "Paid Lead";
 
+    // Optional SalesRep (numeric Mindbody staff Id) from the Sheet payload.
+    // When provided this becomes the "Rep 1" on the created client profile.
+    // Not provided = behavior unchanged (no rep assigned by this code).
+    const salesRepRaw = body.lead?.salesRep;
+    const salesRepNum =
+      salesRepRaw !== undefined && salesRepRaw !== null && salesRepRaw !== ""
+        ? Number(salesRepRaw)
+        : undefined;
+    const salesRep =
+      salesRepNum !== undefined && Number.isFinite(salesRepNum)
+        ? salesRepNum
+        : undefined;
+
     if (!sheetId || !sheetName || !rowNumber) {
       return NextResponse.json(
         { ok: false, error: "Missing sheetId, sheetName, or rowNumber" },
@@ -85,11 +98,11 @@ export async function POST(req: Request) {
       }
 
       // Row was marked processed but no client exists in Mindbody.
-      // Recreate using the per-row referralType.
+      // Recreate using the per-row referralType and salesRep.
       const created = await createClient(
         siteId,
         { firstName, lastName, email, phone },
-        { referralType }
+        { referralType, salesRep }
       );
 
       return NextResponse.json({
@@ -117,12 +130,11 @@ export async function POST(req: Request) {
     }
 
     // create in Mindbody
-    // referralType is applied here (Google Sheets flow).
-    // Per-row override from body.lead.referralType, falling back to "Paid Lead".
+    // referralType and salesRep are applied here (Google Sheets flow).
     const created = await createClient(
       siteId,
       { firstName, lastName, email, phone },
-      { referralType }
+      { referralType, salesRep }
     );
 
     return NextResponse.json({
