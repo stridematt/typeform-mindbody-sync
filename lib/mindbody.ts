@@ -147,11 +147,20 @@ export async function createClient(
 
 /**
  * Update an existing client.
+ *
+ * Optional:
+ *   - salesRep: numeric staff Id for Rep 1
+ *   - prospectStageDescription: name of a Sales Pipeline stage. Per Mindbody
+ *     docs, on Ultimate-tier accounts the UpdateClient endpoint can move a
+ *     client into a Sales Pipeline stage when both IsProspect=true and
+ *     ProspectStage.Description are set. Docs only explicitly mention
+ *     "New Lead" as a working value; custom stages like "Call Center" are
+ *     untested and may or may not work depending on tenant configuration.
  */
 export async function updateClient(
   siteId: number,
   mbClientId: string | number,
-  updates: { salesRep?: number }
+  updates: { salesRep?: number; prospectStageDescription?: string }
 ) {
   const client = await mbClient(siteId);
 
@@ -170,6 +179,19 @@ export async function updateClient(
         SalesRepNumber: 1,
       },
     ];
+  }
+
+  if (
+    typeof updates.prospectStageDescription === "string" &&
+    updates.prospectStageDescription.trim()
+  ) {
+    // Per docs: setting IsProspect=true alongside ProspectStage.Description
+    // is what triggers the Sales Pipeline opportunity create/move on
+    // Ultimate-tier accounts.
+    clientPayload.IsProspect = true;
+    clientPayload.ProspectStage = {
+      Description: updates.prospectStageDescription.trim(),
+    };
   }
 
   const res = await client.post(`/client/updateclient`, {
