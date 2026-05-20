@@ -33,10 +33,18 @@ export async function POST(req: Request) {
         ? salesRepNum
         : undefined;
 
+    const leadChannelIdRaw = body.lead?.leadChannelId;
+    const leadChannelIdNum =
+      leadChannelIdRaw !== undefined && leadChannelIdRaw !== null && leadChannelIdRaw !== ""
+        ? Number(leadChannelIdRaw)
+        : undefined;
+    const leadChannelId =
+      leadChannelIdNum !== undefined && Number.isFinite(leadChannelIdNum)
+        ? leadChannelIdNum
+        : undefined;
+
     // Optional: when true, the webhook will create a Contact Log
-    // immediately after the client is created. The Set Trigger rule
-    // "Sales Followup Task created immediately after lead creation"
-    // should then move the lead into the configured stage.
+    // immediately after the client is created.
     const createFollowupTask = body.lead?.createFollowupTask === true;
 
     if (!sheetId || !sheetName || !rowNumber) {
@@ -122,7 +130,7 @@ export async function POST(req: Request) {
       const created = await createClient(
         siteId,
         { firstName, lastName, email, phone },
-        { referralType, salesRep }
+        { referralType, salesRep, leadChannelId }
       );
 
       const mbClientId = created?.Id ? String(created.Id) : null;
@@ -155,7 +163,7 @@ export async function POST(req: Request) {
     const created = await createClient(
       siteId,
       { firstName, lastName, email, phone },
-      { referralType, salesRep }
+      { referralType, salesRep, leadChannelId }
     );
 
     const mbClientId = created?.Id ? String(created.Id) : null;
