@@ -77,7 +77,9 @@ export async function POST(req: Request) {
     // Helper: best-effort follow-up task creation.
     // Logs failures but does NOT fail the overall request — losing the
     // stage placement is annoying but not as bad as losing the client.
-    async function maybeCreateFollowupTask(mbClientId: string | number | null | undefined) {
+    const maybeCreateFollowupTask = async (
+      mbClientId: string | number | null | undefined
+    ) => {
       if (!createFollowupTask) return null;
       if (!mbClientId) return null;
       try {
@@ -97,7 +99,7 @@ export async function POST(req: Request) {
           String(err);
         return { ok: false, error: detail };
       }
-    }
+    };
 
     if (alreadyProcessed) {
       const existing = await findClient(siteId, {
