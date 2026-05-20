@@ -94,6 +94,9 @@ export async function findClient(
  * Optional:
  *   - referralType: sets the Mindbody Referral Type dropdown (e.g. "Paid Lead")
  *   - salesRep: numeric staff Id assigned to Rep 1 on the client profile
+ *   - leadChannelId: numeric Lead Management channel Id. Tags the lead with
+ *     this channel. If the tenant has automated channel-to-stage mapping
+ *     configured, this can also route the lead to a specific pipeline stage.
  *
  * IMPORTANT: Only pass referralType from your Google Sheets flow.
  * Do NOT pass it from your Typeform flow.
@@ -101,7 +104,7 @@ export async function findClient(
 export async function createClient(
   siteId: number,
   input: { firstName: string; lastName: string; email?: string; phone?: string },
-  options?: { referralType?: string; salesRep?: number }
+  options?: { referralType?: string; salesRep?: number; leadChannelId?: number }
 ) {
   const client = await mbClient(siteId);
 
@@ -128,6 +131,14 @@ export async function createClient(
         SalesRepNumber: 1,
       },
     ];
+  }
+
+  if (
+    options?.leadChannelId !== undefined &&
+    options?.leadChannelId !== null &&
+    Number.isFinite(options.leadChannelId)
+  ) {
+    payload.LeadChannelId = Number(options.leadChannelId);
   }
 
   const res = await client.post(`/client/addclient`, payload);
@@ -232,4 +243,23 @@ export async function addContactLog(
 
   const res = await client.post(`/client/addcontactlog`, payload);
   return res.data ?? null;
+}
+
+/**
+ * List Lead Channels configured for the site.
+ *
+ * Hits GET /site/sites?includeLeadChannels=true per Mindbody docs.
+ * Use the returned Id to populate LeadChannelId in AddClient calls.
+ */
+export async function listLeadChannels(siteId: number) {
+  const client = await mbClient(siteId);
+  const res = await client.get(`/site/sites`, {
+    params: {
+      siteIds: siteId,
+      includeLeadChannels: true,
+    },
+  });
+  // Mindbody returns { Sites: [{ ..., LeadChannels: [...] }] }
+  const sites = res.data?.Sites ?? [];
+  return sites[0]?.LeadChannels ?? [];
 }
