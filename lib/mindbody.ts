@@ -97,16 +97,17 @@ export async function findClient(
 /**
  * Create a prospect client in Mindbody.
  * Optional: set a "Referral Type" / "Referred By" label when provided.
- * Optional: assign a sales rep (Rep 1) by numeric Mindbody staff Id.
+ * Optional: assign a sales rep by numeric Mindbody staff Id. This becomes
+ *   Rep 1 on the client profile.
  *
  * IMPORTANT: Only pass referralType from your Google Sheets flow.
  * Do NOT pass it from your Typeform flow.
  *
- * NOTE on salesRep:
- *   We send AssignedSalesReps (array) on AddClient, which is what the Mindbody
- *   UI uses for Rep 1. A prior attempt with the singular `SalesRep` field was
- *   silently dropped by this tenant. If this still doesn't stick, we'll need
- *   to follow up with an explicit /client/updateclient call.
+ * Per Mindbody Public API docs for AddClient:
+ *   https://developers.mindbodyonline.com/ui/documentation/public-api#/http/models/structures/add-client-request
+ *   Field name is `SalesReps` (plural), array of Sales Rep objects.
+ *   Each entry: { Id: <staff Id>, SalesRepNumber: 1 } where SalesRepNumber
+ *   identifies the rep slot (1 = Rep 1).
  */
 export async function createClient(
   siteId: number,
@@ -132,7 +133,12 @@ export async function createClient(
     options?.salesRep !== null &&
     Number.isFinite(options.salesRep)
   ) {
-    payload.AssignedSalesReps = [{ Id: Number(options.salesRep) }];
+    payload.SalesReps = [
+      {
+        Id: Number(options.salesRep),
+        SalesRepNumber: 1,
+      },
+    ];
   }
 
   const res = await client.post(`/client/addclient`, payload);
@@ -140,8 +146,9 @@ export async function createClient(
 }
 
 /**
- * Update an existing client. Used as a fallback to set the sales rep
- * if AddClient silently drops the assignment.
+ * Update an existing client. Available as a fallback if AddClient ever
+ * stops applying SalesReps for some reason; not currently called from the
+ * webhook route.
  */
 export async function updateClient(
   siteId: number,
@@ -159,7 +166,12 @@ export async function updateClient(
     updates.salesRep !== null &&
     Number.isFinite(updates.salesRep)
   ) {
-    clientPayload.AssignedSalesReps = [{ Id: Number(updates.salesRep) }];
+    clientPayload.SalesReps = [
+      {
+        Id: Number(updates.salesRep),
+        SalesRepNumber: 1,
+      },
+    ];
   }
 
   const res = await client.post(`/client/updateclient`, {
