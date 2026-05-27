@@ -95,7 +95,7 @@ export async function POST(req: Request) {
     if (!client?.Id) {
       client = await createClient(siteId, {
         firstName,
-        lastName: "(X)", // form collects first name only
+        lastName: "(STRIDE Lead)", // form collects first name only
         phone,
       });
       status = "created";
