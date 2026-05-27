@@ -184,9 +184,37 @@ function last10(s?: string | null) {
 }
 
 function buildLogText(b: any): string {
+  const tierLabel: Record<string, string> = {
+    ignite: "Ignite",
+    core: "Core",
+    elite: "Elite",
+  };
+
+  // Format the day-by-day plan, if present.
+  let planBlock = "";
+  if (Array.isArray(b?.plan) && b.plan.length) {
+    const lines = b.plan.map((p: any) => {
+      const day = String(p?.day ?? "").trim();
+      const focus = String(p?.focus ?? "").trim();
+      const format = String(p?.format ?? "").trim();
+      const bits = [day && `${day}:`, focus, format && `(${format})`].filter(Boolean);
+      return `  - ${bits.join(" ")}`;
+    });
+    planBlock = `Suggested weekly plan:\n${lines.join("\n")}`;
+  }
+
+  const recTier = b?.recommended_tier ? (tierLabel[b.recommended_tier] || String(b.recommended_tier)) : "";
+
   const parts = [
     "STRIDE website — coach intake",
+    b?.studio ? `Studio: ${String(b.studio).trim()}` : null,
     b?.goals_csv ? `Goals: ${String(b.goals_csv).trim()}` : null,
+    b?.days_csv ? `Training days: ${String(b.days_csv).trim()}` : null,
+    b?.days_per_week ? `Days per week: ${b.days_per_week}` : null,
+    b?.formats_csv ? `Formats: ${String(b.formats_csv).trim()}` : null,
+    b?.weekly_minutes ? `Weekly minutes: ${b.weekly_minutes}` : null,
+    recTier ? `Recommended membership: ${recTier}` : null,
+    planBlock || null,
     b?.injuries ? `Anything to know (injuries/recovery):\n${String(b.injuries).trim()}` : null,
     b?.story ? `Their story (why now / what they're chasing):\n${String(b.story).trim()}` : null,
   ].filter(Boolean);
