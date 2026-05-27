@@ -6,16 +6,15 @@ export const runtime = "nodejs";
 
 /* ============================================================
    STUDIO -> MINDBODY SITE ID
-   Fill in each studio's real Mindbody SiteId via env vars
-   (recommended) or by replacing the "X" fallback directly.
+   Reads each studio's SiteId from Vercel env vars.
    Keys must match exactly what the website sends in `studio`.
 ============================================================ */
 const STUDIO_SITE_IDS: Record<string, number> = {
-  "Huntington Beach": Number(process.env.MINDBODY_SITE_ID_HB ?? "X"),
-  "Pasadena":         Number(process.env.MINDBODY_SITE_ID_PASADENA ?? "X"),
-  "Tustin":           Number(process.env.MINDBODY_SITE_ID_TUSTIN ?? "X"),
-  "Southlands":       Number(process.env.MINDBODY_SITE_ID_SOUTHLANDS ?? "X"),
-  "Southampton":      Number(process.env.MINDBODY_SITE_ID_SOUTHAMPTON ?? "X"),
+  "Huntington Beach": Number(process.env.MINDBODY_SITE_ID_HB),
+  "Pasadena":         Number(process.env.MINDBODY_SITE_ID_PASADENA),
+  "Tustin":           Number(process.env.MINDBODY_SITE_ID_TUSTIN),
+  "Southlands":       Number(process.env.MINDBODY_SITE_ID_SOUTHLANDS),
+  "Southampton":      Number(process.env.MINDBODY_SITE_ID_SOUTHAMPTON),
 };
 
 /* ============================================================
@@ -39,6 +38,28 @@ function originAllowed(origin: string): boolean {
   }
 }
 
+// CORS headers. Reflects the request Origin only if it's allowed, so the
+// browser permits the cross-origin POST from the STRIDE site.
+function corsHeaders(origin: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+  if (originAllowed(origin)) headers["Access-Control-Allow-Origin"] = origin;
+  return headers;
+}
+
+// Preflight: the browser sends OPTIONS before the JSON POST.
+export async function OPTIONS(req: Request) {
+  const origin = req.headers.get("origin") || "";
+  if (!originAllowed(origin)) {
+    return new NextResponse(null, { status: 403 });
+  }
+  return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
+}
+
 function digitsOnly(s?: string | null) {
   return (s || "").replace(/\D/g, "");
 }
@@ -58,11 +79,16 @@ function buildLogText(b: any): string {
 }
 
 export async function POST(req: Request) {
+  const origin = req.headers.get("origin") || req.headers.get("referer") || "";
+  const cors = corsHeaders(origin);
+  // Wrap NextResponse.json so every reply carries CORS headers.
+  const json = (data: any, init?: { status?: number }) =>
+    NextResponse.json(data, { status: init?.status ?? 200, headers: cors });
+
   try {
     // --- origin lock ---
-    const origin = req.headers.get("origin") || req.headers.get("referer") || "";
     if (!originAllowed(origin)) {
-      return NextResponse.json({ ok: false, error: "Origin not allowed" }, { status: 403 });
+      return json({ ok: false, error: "Origin not allowed" }, { status: 403 });
     }
 
     const body = await req.json().catch(() => ({}));
@@ -73,16 +99,13 @@ export async function POST(req: Request) {
 
     const siteId = STUDIO_SITE_IDS[studio];
     if (!siteId || Number.isNaN(siteId)) {
-      return NextResponse.json(
-        { ok: false, error: `Unknown or unconfigured studio: ${studio}` },
-        { status: 400 }
-      );
+      return json({ ok: false, error: `Unknown or unconfigured studio: ${studio}` }, { status: 400 });
     }
     if (!firstName) {
-      return NextResponse.json({ ok: false, error: "Missing first_name" }, { status: 400 });
+      return json({ ok: false, error: "Missing first_name" }, { status: 400 });
     }
     if (!last10(phone)) {
-      return NextResponse.json({ ok: false, error: "Missing or invalid phone" }, { status: 400 });
+      return json({ ok: false, error: "Missing or invalid phone" }, { status: 400 });
     }
 
     // 1) Find or create the client (phone is the match key; first name only).
@@ -103,10 +126,7 @@ export async function POST(req: Request) {
 
     const clientId = client?.Id ? String(client.Id) : null;
     if (!clientId) {
-      return NextResponse.json(
-        { ok: false, error: "Could not find or create client" },
-        { status: 502 }
-      );
+      return json({ ok: false, error: "Could not find or create client" }, { status: 502 });
     }
 
     // 2) Write the contact log with the coach intake info.
@@ -115,16 +135,14 @@ export async function POST(req: Request) {
       text: buildLogText(body),
       contactMethod: "Phone",
       contactName: firstName,
-      // No assignedToStaffId here -> logged as a contact-log entry.
-      // If you WANT it to become an open Sales-Pipeline follow-up task,
-      // pass a staff Id (e.g. via env or per-studio map) — see note in chat.
+      // No assignedToStaffId -> logged as a contact-log entry (not a follow-up task).
     });
 
-    return NextResponse.json({ ok: true, status, clientId, studio, siteId, mindbody: mb });
+    return json({ ok: true, status, clientId, studio, siteId, mindbody: mb });
   } catch (err: any) {
     const mbStatus = err?.response?.status ?? null;
     const mbData = err?.response?.data ?? null;
-    return NextResponse.json(
+    return json(
       { ok: false, error: err?.message ?? "Server error", mindbody: { status: mbStatus, data: mbData } },
       { status: 500 }
     );
