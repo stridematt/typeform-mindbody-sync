@@ -1,8 +1,72 @@
 // app/api/coach-log/route.ts
 import { NextResponse } from "next/server";
-import { findClient, createClient, addContactLog } from "../../../lib/mindbody";
+import axios from "axios";
+import { findClient, createClient } from "../../../lib/mindbody";
 
 export const runtime = "nodejs";
+
+const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
+
+// Token cache per SiteId (mirrors lib/mindbody's internal pattern).
+const _coachTokenCache = new Map<number, { token: string; issuedAt: number }>();
+const _COACH_TOKEN_TTL_MS = 10 * 60 * 1000;
+
+async function coachGetToken(siteId: number): Promise<string> {
+  const apiKey = process.env.MINDBODY_API_KEY;
+  const username = process.env.MINDBODY_USERNAME;
+  const password = process.env.MINDBODY_PASSWORD;
+  if (!apiKey || !username || !password) throw new Error("Missing Mindbody credentials");
+
+  const cached = _coachTokenCache.get(siteId);
+  if (cached && Date.now() - cached.issuedAt < _COACH_TOKEN_TTL_MS) return cached.token;
+
+  const res = await axios.post(
+    `${MINDBODY_BASE_URL}/usertoken/issue`,
+    { Username: username, Password: password },
+    { headers: { "Content-Type": "application/json", "Api-Key": apiKey, SiteId: String(siteId) }, timeout: 20000 }
+  );
+  const token = res.data?.AccessToken as string | undefined;
+  if (!token) throw new Error("Mindbody token response missing AccessToken");
+  _coachTokenCache.set(siteId, { token, issuedAt: Date.now() });
+  return token;
+}
+
+/**
+ * Add a plain CONTACT LOG entry (not a follow-up task).
+ *
+ * IMPORTANT: Mindbody's addcontactlog requires that FollowupByDate and
+ * AssignedTo are either BOTH present or BOTH absent ("Must include
+ * FollowupByDate with AssignedTo and vice versa"). lib/mindbody's
+ * addContactLog always sets FollowupByDate (for the Sales Pipeline task
+ * flow), so we can't use it for a log-only entry. This sends neither field.
+ */
+async function coachAddContactLog(
+  siteId: number,
+  input: { clientId: string; text: string; contactName?: string; contactMethod?: string }
+) {
+  const apiKey = process.env.MINDBODY_API_KEY as string;
+  const token = await coachGetToken(siteId);
+
+  const payload: Record<string, any> = {
+    ClientId: String(input.clientId),
+    Text: input.text,
+    // NO FollowupByDate and NO AssignedToStaffId -> logged as a plain
+    // contact-log entry, satisfying Mindbody's pairing rule.
+  };
+  if (input.contactMethod) payload.ContactMethod = input.contactMethod;
+  if (input.contactName) payload.ContactName = input.contactName;
+
+  const res = await axios.post(`${MINDBODY_BASE_URL}/client/addcontactlog`, payload, {
+    headers: {
+      "Content-Type": "application/json",
+      "Api-Key": apiKey,
+      Authorization: `Bearer ${token}`,
+      SiteId: String(siteId),
+    },
+    timeout: 25000,
+  });
+  return res.data ?? null;
+}
 
 /* ============================================================
    STUDIO -> MINDBODY SITE ID
@@ -26,6 +90,23 @@ const STUDIO_SITE_IDS: Record<string, number> = {
 ============================================================ */
 const ALLOWED_ORIGIN_SUFFIXES = ["stridefitness.com"]; // matches www. and bare domain
 
+// Pull a usable origin from either the Origin header (normal CORS) or the
+// Referer (some embeds/browsers send Referer but omit Origin on preflight).
+function getRequestOrigin(req: Request): string {
+  const origin = req.headers.get("origin");
+  if (origin) return origin;
+  const referer = req.headers.get("referer");
+  if (referer) {
+    try {
+      const u = new URL(referer);
+      return `${u.protocol}//${u.host}`; // strip path -> scheme + host
+    } catch {
+      /* ignore */
+    }
+  }
+  return "";
+}
+
 function originAllowed(origin: string): boolean {
   if (!origin) return false;
   try {
@@ -38,8 +119,7 @@ function originAllowed(origin: string): boolean {
   }
 }
 
-// CORS headers. Reflects the request Origin only if it's allowed, so the
-// browser permits the cross-origin POST from the STRIDE site.
+// CORS headers. Echoes the request origin when it's an allowed STRIDE domain.
 function corsHeaders(origin: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -51,12 +131,11 @@ function corsHeaders(origin: string): Record<string, string> {
   return headers;
 }
 
-// Preflight: the browser sends OPTIONS before the JSON POST.
+// Preflight: ALWAYS answer 204 with CORS headers. The browser needs the
+// Access-Control-Allow-Origin header here or it blocks the follow-up POST.
+// The real authorization check happens on the POST below.
 export async function OPTIONS(req: Request) {
-  const origin = req.headers.get("origin") || "";
-  if (!originAllowed(origin)) {
-    return new NextResponse(null, { status: 403 });
-  }
+  const origin = getRequestOrigin(req);
   return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
 }
 
@@ -79,7 +158,7 @@ function buildLogText(b: any): string {
 }
 
 export async function POST(req: Request) {
-  const origin = req.headers.get("origin") || req.headers.get("referer") || "";
+  const origin = getRequestOrigin(req);
   const cors = corsHeaders(origin);
   // Wrap NextResponse.json so every reply carries CORS headers.
   const json = (data: any, init?: { status?: number }) =>
@@ -130,12 +209,12 @@ export async function POST(req: Request) {
     }
 
     // 2) Write the contact log with the coach intake info.
-    const mb = await addContactLog(siteId, {
+    const mb = await coachAddContactLog(siteId, {
       clientId,
       text: buildLogText(body),
       contactMethod: "Phone",
       contactName: firstName,
-      // No assignedToStaffId -> logged as a contact-log entry (not a follow-up task).
+      // log-only: no FollowupByDate / AssignedTo -> plain contact-log entry.
     });
 
     return json({ ok: true, status, clientId, studio, siteId, mindbody: mb });
