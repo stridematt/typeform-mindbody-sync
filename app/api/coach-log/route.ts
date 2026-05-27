@@ -1,7 +1,7 @@
 // app/api/coach-log/route.ts
 import { NextResponse } from "next/server";
 import axios from "axios";
-import { findClient, createClient } from "../../../lib/mindbody";
+import { createClient } from "../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
@@ -50,10 +50,11 @@ async function coachAddContactLog(
   const payload: Record<string, any> = {
     ClientId: String(input.clientId),
     Text: input.text,
+    // ContactMethod is REQUIRED by Mindbody's addcontactlog. Always send it.
+    ContactMethod: input.contactMethod || "Phone",
     // NO FollowupByDate and NO AssignedToStaffId -> logged as a plain
     // contact-log entry, satisfying Mindbody's pairing rule.
   };
-  if (input.contactMethod) payload.ContactMethod = input.contactMethod;
   if (input.contactName) payload.ContactName = input.contactName;
 
   const res = await axios.post(`${MINDBODY_BASE_URL}/client/addcontactlog`, payload, {
@@ -66,6 +67,41 @@ async function coachAddContactLog(
     timeout: 25000,
   });
   return res.data ?? null;
+}
+
+/**
+ * Strict phone match. lib/mindbody's findClient returns only the FIRST
+ * SearchText result without verifying the phone, which can map a lead to
+ * the WRONG existing client. This searches Mindbody directly and returns a
+ * client ONLY if one of its phone fields matches the last-10 digits.
+ * Scans all results, not just the first.
+ */
+async function findClientByPhoneStrict(siteId: number, phone: string) {
+  const key10 = last10(phone);
+  if (!key10) return null;
+
+  const apiKey = process.env.MINDBODY_API_KEY as string;
+  const token = await coachGetToken(siteId);
+
+  const res = await axios.get(`${MINDBODY_BASE_URL}/client/clients`, {
+    headers: {
+      "Content-Type": "application/json",
+      "Api-Key": apiKey,
+      Authorization: `Bearer ${token}`,
+      SiteId: String(siteId),
+    },
+    params: { SearchText: key10, Limit: 100, Offset: 0 },
+    timeout: 25000,
+  });
+
+  const clients: any[] = res.data?.Clients ?? [];
+  // Return the first client whose phone ACTUALLY matches (not just a fuzzy hit).
+  return (
+    clients.find((c) => {
+      const phones = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].map((p) => last10(p));
+      return phones.includes(key10);
+    }) ?? null
+  );
 }
 
 /* ============================================================
@@ -187,11 +223,13 @@ export async function POST(req: Request) {
       return json({ ok: false, error: "Missing or invalid phone" }, { status: 400 });
     }
 
-    // 1) Find or create the client (phone is the match key; first name only).
+    // 1) Find or create the client. We match STRICTLY on phone (last-10) so a
+    //    fuzzy Mindbody search can never attach the log to the wrong client.
+    //    If no phone-exact client exists, we create a new one.
     //    NOTE: per lib/mindbody, we deliberately do NOT pass referralType/
     //    salesRep/leadChannelId here — this is the website flow, not the
     //    Google Sheets "Paid Leads" flow.
-    let client = await findClient(siteId, { firstName, phone });
+    let client = await findClientByPhoneStrict(siteId, phone);
     let status = "found";
 
     if (!client?.Id) {
