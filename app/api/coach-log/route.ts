@@ -1,6 +1,6 @@
 // app/api/coach-log/route.ts
 import { NextResponse } from "next/server";
-import { findClient, createClient, addContactLog } from "../../../../lib/mindbody";
+import { findClient, createClient, addContactLog } from "../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
