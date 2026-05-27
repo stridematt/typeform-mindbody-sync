@@ -1,13 +1,13 @@
+// app/api/coach-log/route.ts
 import { NextResponse } from "next/server";
-import axios from "axios";
+import { findClient, createClient, addContactLog } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
-const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
-
 /* ============================================================
-   STUDIO -> MINDBODY SITE ID MAP
-   Fill in each studio's real Mindbody SiteId (replace the Xs).
+   STUDIO -> MINDBODY SITE ID
+   Fill in each studio's real Mindbody SiteId via env vars
+   (recommended) or by replacing the "X" fallback directly.
    Keys must match exactly what the website sends in `studio`.
 ============================================================ */
 const STUDIO_SITE_IDS: Record<string, number> = {
@@ -19,53 +19,24 @@ const STUDIO_SITE_IDS: Record<string, number> = {
 };
 
 /* ============================================================
-   LIGHTWEIGHT ABUSE GUARD
-   The browser calls this directly, so it can't carry a powerful
-   secret. We (1) only accept requests from the STRIDE domain and
-   (2) check a low-privilege submit token. The real Mindbody
-   credentials live in server-side env vars and are never exposed.
+   ABUSE GUARD
+   This endpoint is called from the visitor's browser, so it
+   carries no powerful secret. Protection = origin lock to the
+   STRIDE domain. The Mindbody credentials live server-side in
+   env vars (used inside lib/mindbody) and are never exposed.
 ============================================================ */
-const ALLOWED_ORIGINS = [
-  "https://X", // e.g. "https://www.stridefitness.com" — the domain the page is embedded on
-];
-// Optional extra check: a public, low-privilege token the page sends.
-// Safe to expose because this endpoint can only write a contact log.
-const PUBLIC_SUBMIT_TOKEN = process.env.COACH_LOG_PUBLIC_TOKEN ?? "X";
+const ALLOWED_ORIGIN_SUFFIXES = ["stridefitness.com"]; // matches www. and bare domain
 
-/* ============================================================
-   Token cache per SiteId (mirrors your existing pattern)
-============================================================ */
-const tokenCache = new Map<number, { token: string; expiresAt: number }>();
-
-function baseHeaders(siteId: number) {
-  const apiKey = process.env.MINDBODY_API_KEY;
-  if (!apiKey) throw new Error("Missing MINDBODY_API_KEY env var");
-  return { "Api-Key": apiKey, SiteId: String(siteId), "Content-Type": "application/json" };
-}
-
-async function getUserToken(siteId: number) {
-  const username = process.env.MINDBODY_USERNAME;
-  const password = process.env.MINDBODY_PASSWORD;
-  if (!username || !password) throw new Error("Missing MINDBODY_USERNAME or MINDBODY_PASSWORD");
-
-  const now = Date.now();
-  const cached = tokenCache.get(siteId);
-  if (cached && cached.expiresAt > now) return cached.token;
-
-  const resp = await axios.post(
-    `${MINDBODY_BASE_URL}/usertoken/issue`,
-    { Username: username, Password: password },
-    { headers: baseHeaders(siteId), timeout: 15000 }
-  );
-  const token = resp.data?.AccessToken;
-  if (!token) throw new Error("No AccessToken returned");
-  tokenCache.set(siteId, { token, expiresAt: now + 45 * 60 * 1000 });
-  return token;
-}
-
-async function authHeaders(siteId: number) {
-  const token = await getUserToken(siteId);
-  return { ...baseHeaders(siteId), Authorization: `Bearer ${token}` };
+function originAllowed(origin: string): boolean {
+  if (!origin) return false;
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    return ALLOWED_ORIGIN_SUFFIXES.some(
+      (suf) => host === suf || host.endsWith("." + suf)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function digitsOnly(s?: string | null) {
@@ -76,102 +47,25 @@ function last10(s?: string | null) {
   return d.length > 10 ? d.slice(-10) : d;
 }
 
-/* ============================================================
-   Find client by phone (your GET /client/clients pattern)
-============================================================ */
-async function findClientByPhone(siteId: number, phone: string) {
-  const key10 = last10(phone);
-  if (!key10) return null;
-
-  const resp = await axios.get(`${MINDBODY_BASE_URL}/client/clients`, {
-    headers: await authHeaders(siteId),
-    params: { SearchText: key10, Limit: 25, Offset: 0 },
-    timeout: 15000,
-  });
-
-  const clients: any[] = resp.data?.Clients ?? [];
-  // Confirm the phone actually matches (SearchText can be fuzzy)
-  const hit = clients.find((c) => {
-    const phones = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].map((p) => last10(p));
-    return phones.includes(key10);
-  });
-  return hit ?? null;
-}
-
-/* ============================================================
-   Create client (first name + phone; last name optional)
-============================================================ */
-async function createClient(siteId: number, params: { firstName: string; lastName: string; phone: string }) {
-  const payload = {
-    Client: {
-      FirstName: params.firstName,
-      LastName: params.lastName,
-      MobilePhone: digitsOnly(params.phone),
-      // Mark as a prospect/lead so it lands in the right place in Mindbody
-      Action: "Add",
-    },
-  };
-  const resp = await axios.post(`${MINDBODY_BASE_URL}/client/addclient`, payload, {
-    headers: await authHeaders(siteId),
-    timeout: 15000,
-  });
-  return resp.data?.Client ?? null;
-}
-
-/* ============================================================
-   Add contact log
-============================================================ */
-async function addContactLog(siteId: number, params: { clientId: string; text: string; contactName: string }) {
-  const typeId = process.env.MINDBODY_CONTACT_LOG_TYPE_ID
-    ? Number(process.env.MINDBODY_CONTACT_LOG_TYPE_ID)
-    : undefined;
-
-  const payload: any = {
-    ClientId: params.clientId,
-    Text: params.text,
-    ContactMethod: "Phone",
-    ContactName: params.contactName,
-    Test: false,
-  };
-  if (typeId !== undefined && Number.isFinite(typeId)) payload.TypeId = typeId;
-
-  const resp = await axios.post(`${MINDBODY_BASE_URL}/client/addcontactlog`, payload, {
-    headers: await authHeaders(siteId),
-    timeout: 15000,
-  });
-  return resp.data ?? null;
-}
-
-/* ============================================================
-   Build the contact-log text from the coach form fields
-============================================================ */
 function buildLogText(b: any): string {
   const parts = [
     "STRIDE website — coach intake",
-    b.goals_csv ? `Goals: ${b.goals_csv}` : null,
-    b.injuries ? `Anything to know (injuries/recovery):\n${String(b.injuries).trim()}` : null,
-    b.story ? `Their story (why now / what they're chasing):\n${String(b.story).trim()}` : null,
+    b?.goals_csv ? `Goals: ${String(b.goals_csv).trim()}` : null,
+    b?.injuries ? `Anything to know (injuries/recovery):\n${String(b.injuries).trim()}` : null,
+    b?.story ? `Their story (why now / what they're chasing):\n${String(b.story).trim()}` : null,
   ].filter(Boolean);
   return parts.join("\n\n").slice(0, 3800);
 }
 
-/* ============================================================
-   Handler
-============================================================ */
 export async function POST(req: Request) {
   try {
-    // --- abuse guard: origin + public token ---
+    // --- origin lock ---
     const origin = req.headers.get("origin") || req.headers.get("referer") || "";
-    const originOk = ALLOWED_ORIGINS.some((o) => o !== "https://X" && origin.startsWith(o));
-    if (!originOk) {
+    if (!originAllowed(origin)) {
       return NextResponse.json({ ok: false, error: "Origin not allowed" }, { status: 403 });
     }
 
     const body = await req.json().catch(() => ({}));
-
-    if (PUBLIC_SUBMIT_TOKEN !== "X" && body?.token !== PUBLIC_SUBMIT_TOKEN) {
-      return NextResponse.json({ ok: false, error: "Bad token" }, { status: 401 });
-    }
 
     const studio = String(body?.studio || "").trim();
     const firstName = String(body?.first_name || "").trim();
@@ -179,7 +73,10 @@ export async function POST(req: Request) {
 
     const siteId = STUDIO_SITE_IDS[studio];
     if (!siteId || Number.isNaN(siteId)) {
-      return NextResponse.json({ ok: false, error: `Unknown or unconfigured studio: ${studio}` }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: `Unknown or unconfigured studio: ${studio}` },
+        { status: 400 }
+      );
     }
     if (!firstName) {
       return NextResponse.json({ ok: false, error: "Missing first_name" }, { status: 400 });
@@ -188,13 +85,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: "Missing or invalid phone" }, { status: 400 });
     }
 
-    // 1) Find or create the client (phone is the match key)
-    let client = await findClientByPhone(siteId, phone);
+    // 1) Find or create the client (phone is the match key; first name only).
+    //    NOTE: per lib/mindbody, we deliberately do NOT pass referralType/
+    //    salesRep/leadChannelId here — this is the website flow, not the
+    //    Google Sheets "Paid Leads" flow.
+    let client = await findClient(siteId, { firstName, phone });
     let status = "found";
+
     if (!client?.Id) {
       client = await createClient(siteId, {
         firstName,
-        lastName: "(STRIDE Lead)", // form collects first name only; placeholder last name
+        lastName: "(X)", // form collects first name only
         phone,
       });
       status = "created";
@@ -202,14 +103,21 @@ export async function POST(req: Request) {
 
     const clientId = client?.Id ? String(client.Id) : null;
     if (!clientId) {
-      return NextResponse.json({ ok: false, error: "Could not find or create client" }, { status: 502 });
+      return NextResponse.json(
+        { ok: false, error: "Could not find or create client" },
+        { status: 502 }
+      );
     }
 
-    // 2) Write the contact log
+    // 2) Write the contact log with the coach intake info.
     const mb = await addContactLog(siteId, {
       clientId,
       text: buildLogText(body),
+      contactMethod: "Phone",
       contactName: firstName,
+      // No assignedToStaffId here -> logged as a contact-log entry.
+      // If you WANT it to become an open Sales-Pipeline follow-up task,
+      // pass a staff Id (e.g. via env or per-studio map) — see note in chat.
     });
 
     return NextResponse.json({ ok: true, status, clientId, studio, siteId, mindbody: mb });
