@@ -233,9 +233,15 @@ export async function POST(req: Request) {
     let status = "found";
 
     if (!client?.Id) {
+      // Mindbody's AddClient REQUIRES a non-empty Email. The form doesn't
+      // collect one, so generate a unique placeholder keyed to the phone
+      // (mirrors the Google Sheets flow's fallback-email approach). Using the
+      // phone digits keeps it stable + unique so re-submits don't collide.
+      const fallbackEmail = `lead+${last10(phone)}@stridefitness-leads.com`;
       client = await createClient(siteId, {
         firstName,
         lastName: "(STRIDE Lead)", // form collects first name only
+        email: fallbackEmail,
         phone,
       });
       status = "created";
