@@ -12,7 +12,8 @@ const sql = neon(
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 
-// Hardcoded HB site ID for Sheets-originated flows (lookup + updateClient).
+// Default site for Sheets-originated flows when siteKey is missing.
+// Kept for backward-compat with the original HB-only sheet.
 const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
 
 const MB_BASE = "https://api.mindbodyonline.com/public/v6";
@@ -65,6 +66,42 @@ function verifySheetsSecret(req: Request) {
   if (!timingSafeEqual(provided, secret)) return { ok: false, reason: "Bad secret" };
 
   return { ok: true };
+}
+
+/* ---------- Multi-studio site resolution ---------- */
+
+/**
+ * Resolve a payload siteKey (e.g. "TUSTIN") to a Mindbody Site ID, by looking
+ * up the env var MINDBODY_SITE_ID_{KEY}. Falls back to HB when siteKey is
+ * blank, so existing HB-only sheets keep working without modification.
+ *
+ * Returns { ok: true, siteId } on success or { ok: false, reason } on failure.
+ */
+function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: false; reason: string } {
+  const rawKey = String(siteKey || "").trim();
+
+  // No siteKey provided -> default to HB for backward compatibility.
+  if (!rawKey) {
+    if (!HB_SITE_ID) {
+      return { ok: false, reason: "Missing MINDBODY_SITE_ID_HB on server (no siteKey provided)" };
+    }
+    return { ok: true, siteId: HB_SITE_ID };
+  }
+
+  // siteKey must be alphanumeric/underscore only to safely build the env name.
+  if (!/^[A-Za-z0-9_]+$/.test(rawKey)) {
+    return { ok: false, reason: `Invalid siteKey: ${rawKey}` };
+  }
+
+  const envName = `MINDBODY_SITE_ID_${rawKey.toUpperCase()}`;
+  const raw = process.env[envName];
+  const parsed = Number(raw || 0);
+
+  if (!parsed) {
+    return { ok: false, reason: `Unknown siteKey "${rawKey}" (missing ${envName} on server)` };
+  }
+
+  return { ok: true, siteId: parsed };
 }
 
 /* ---------- Generic helpers ---------- */
@@ -441,19 +478,20 @@ async function handleSheetsLookup(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
 
-  if (!HB_SITE_ID) {
-    return serverError("Missing MINDBODY_SITE_ID_HB on server");
-  }
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
 
   const lead = payload?.lead ?? {};
   const phone = digitsOnly(String(lead?.phone || ""));
   if (!phone) return badRequest("Missing lead.phone");
 
   console.log("sheets lookup request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
     rowNumber: payload?.rowNumber,
     backfill: !!payload?.backfill,
-    phoneDigits: phone,
-    siteId: HB_SITE_ID
+    phoneDigits: phone
   });
 
   try {
@@ -466,7 +504,7 @@ async function handleSheetsLookup(req: Request, payload: any) {
     let lastResult: MbResult | null = null;
 
     for (const searchText of searchCandidates) {
-      const result = await mindbodyGetClientsBySearch(HB_SITE_ID, searchText);
+      const result = await mindbodyGetClientsBySearch(siteId, searchText);
       lastResult = result;
 
       if (!result.ok) {
@@ -509,7 +547,7 @@ async function handleSheetsLookup(req: Request, payload: any) {
         ok: true,
         status: "found",
         mbClientId: String(matched.Id),
-        siteId: HB_SITE_ID
+        siteId
       });
     }
 
@@ -537,9 +575,9 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
 
-  if (!HB_SITE_ID) {
-    return serverError("Missing MINDBODY_SITE_ID_HB on server");
-  }
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
 
   const client = payload?.client ?? {};
   const mbClientId = String(client?.mbClientId || "").trim();
@@ -555,6 +593,8 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   }
 
   console.log("sheets updateClient request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
     rowNumber: payload?.rowNumber,
     mbClientId,
     hasFirstName: !!firstName,
@@ -564,7 +604,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   });
 
   try {
-    const result = await mindbodyUpdateClient(HB_SITE_ID, {
+    const result = await mindbodyUpdateClient(siteId, {
       mbClientId,
       firstName,
       lastName,
@@ -593,7 +633,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       ok: true,
       status: "updated",
       mbClientId,
-      siteId: HB_SITE_ID,
+      siteId,
       mindbody: result.data
     });
   } catch (err: any) {
@@ -608,9 +648,9 @@ async function handleSheetsCreate(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
 
-  if (!HB_SITE_ID) {
-    return serverError("Missing MINDBODY_SITE_ID_HB on server");
-  }
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
 
   const lead = payload?.lead ?? {};
   const firstName = String(lead?.firstName || "").trim();
@@ -630,6 +670,8 @@ async function handleSheetsCreate(req: Request, payload: any) {
   const phone = digitsOnly(rawPhone) || digitsOnly(makeDummyPhone(seed));
 
   console.log("sheets create request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
     rowNumber: payload?.rowNumber,
     backfill: !!payload?.backfill,
     firstName,
@@ -638,12 +680,11 @@ async function handleSheetsCreate(req: Request, payload: any) {
     phoneDigits: phone,
     leadSource: lead?.leadSource ?? null,
     referralType: lead?.referralType ?? null,
-    salesRep: lead?.salesRep ?? null,
-    siteId: HB_SITE_ID
+    salesRep: lead?.salesRep ?? null
   });
 
   try {
-    const existing = await findClient(HB_SITE_ID, {
+    const existing = await findClient(siteId, {
       firstName,
       lastName,
       email,
@@ -655,7 +696,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
         ok: true,
         status: "exists",
         mbClientId: String(existing.Id),
-        siteId: HB_SITE_ID,
+        siteId,
         fallbacksUsed: {
           emailWasFallback: !rawEmail,
           phoneWasFallback: !rawPhone
@@ -663,7 +704,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
       });
     }
 
-    const created = await createClient(HB_SITE_ID, {
+    const created = await createClient(siteId, {
       firstName,
       lastName,
       email,
@@ -676,7 +717,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
       ok: true,
       status: "created",
       mbClientId: String(created.Id),
-      siteId: HB_SITE_ID,
+      siteId,
       fallbacksUsed: {
         emailWasFallback: !rawEmail,
         phoneWasFallback: !rawPhone
@@ -903,6 +944,10 @@ export async function POST(req: Request) {
       hasTypeformSecret: !!process.env.TYPEFORM_WEBHOOK_SECRET,
       hasSheetsSecret: !!process.env.SHEETS_WEBHOOK_SECRET,
       hasHbSiteId: !!HB_SITE_ID,
+      hasTustinSiteId: !!process.env.MINDBODY_SITE_ID_TUSTIN,
+      hasSouthlandsSiteId: !!process.env.MINDBODY_SITE_ID_SOUTHLANDS,
+      hasSouthamptonSiteId: !!process.env.MINDBODY_SITE_ID_SOUTHAMPTON,
+      hasPasadenaSiteId: !!process.env.MINDBODY_SITE_ID_PASADENA,
       hasApiKey: !!process.env.MINDBODY_API_KEY,
       hasStaffCreds: !!(
         process.env.MINDBODY_STAFF_USERNAME && process.env.MINDBODY_STAFF_PASSWORD
@@ -930,7 +975,7 @@ export async function POST(req: Request) {
     }
 
     // Sheets lead-capture posts from the Apps Script:
-    //   { sheetId, sheetName, rowNumber, lead, backfill? }
+    //   { sheetId, sheetName, rowNumber, lead, siteKey?, backfill? }
     // Neither lookupOnly nor updateClient — these create (or find) a
     // Mindbody client from a row in the Paid Leads sheet.
     if (earlyPayload?.sheetId && earlyPayload?.lead) {
