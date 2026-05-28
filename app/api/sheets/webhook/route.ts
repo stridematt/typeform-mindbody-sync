@@ -602,6 +602,104 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   }
 }
 
+/* ---------- Sheets -> Mindbody: find-or-create from Paid Leads row ---------- */
+
+async function handleSheetsCreate(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+
+  if (!HB_SITE_ID) {
+    return serverError("Missing MINDBODY_SITE_ID_HB on server");
+  }
+
+  const lead = payload?.lead ?? {};
+  const firstName = String(lead?.firstName || "").trim();
+  const lastName = String(lead?.lastName || "").trim();
+
+  if (!firstName || !lastName) {
+    return badRequest("Missing lead.firstName or lead.lastName");
+  }
+
+  const rawEmail = String(lead?.email || "").trim();
+  const rawPhone = String(lead?.phone || "").trim();
+
+  // The Apps Script fills in fallback email/phone per row, but we re-derive
+  // deterministic fallbacks here if either is somehow blank.
+  const seed = `${payload?.sheetId}:${payload?.rowNumber}:${firstName}:${lastName}`;
+  const email = rawEmail || makeDummyEmail(seed);
+  const phone = digitsOnly(rawPhone) || digitsOnly(makeDummyPhone(seed));
+
+  console.log("sheets create request", {
+    rowNumber: payload?.rowNumber,
+    backfill: !!payload?.backfill,
+    firstName,
+    lastName,
+    email,
+    phoneDigits: phone,
+    leadSource: lead?.leadSource ?? null,
+    referralType: lead?.referralType ?? null,
+    salesRep: lead?.salesRep ?? null,
+    siteId: HB_SITE_ID
+  });
+
+  try {
+    const existing = await findClient(HB_SITE_ID, {
+      firstName,
+      lastName,
+      email,
+      phone
+    });
+
+    if (existing?.Id) {
+      return NextResponse.json({
+        ok: true,
+        status: "exists",
+        mbClientId: String(existing.Id),
+        siteId: HB_SITE_ID,
+        fallbacksUsed: {
+          emailWasFallback: !rawEmail,
+          phoneWasFallback: !rawPhone
+        }
+      });
+    }
+
+    const created = await createClient(HB_SITE_ID, {
+      firstName,
+      lastName,
+      email,
+      phone
+    });
+
+    if (!created?.Id) return serverError("Mindbody create failed");
+
+    return NextResponse.json({
+      ok: true,
+      status: "created",
+      mbClientId: String(created.Id),
+      siteId: HB_SITE_ID,
+      fallbacksUsed: {
+        emailWasFallback: !rawEmail,
+        phoneWasFallback: !rawPhone
+      }
+    });
+  } catch (err: any) {
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+    const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
+    console.log("sheets create mindbody error", { status, where, data });
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: err?.message ?? "Server error",
+        mindbody: { status, where, data }
+      },
+      { status: 500 }
+    );
+  }
+}
+
 /* ---------- Typeform handler ---------- */
 
 async function handleTypeform(req: Request, rawBody: string) {
@@ -829,6 +927,14 @@ export async function POST(req: Request) {
 
     if (earlyPayload?.updateClient === true) {
       return await handleSheetsUpdateClient(req, earlyPayload);
+    }
+
+    // Sheets lead-capture posts from the Apps Script:
+    //   { sheetId, sheetName, rowNumber, lead, backfill? }
+    // Neither lookupOnly nor updateClient — these create (or find) a
+    // Mindbody client from a row in the Paid Leads sheet.
+    if (earlyPayload?.sheetId && earlyPayload?.lead) {
+      return await handleSheetsCreate(req, earlyPayload);
     }
 
     return await handleTypeform(req, rawBody);
