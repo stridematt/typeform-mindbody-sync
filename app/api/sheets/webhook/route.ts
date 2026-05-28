@@ -12,9 +12,12 @@ const sql = neon(
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 
-// Hardcoded HB site ID for the Sheets -> updateClient flow.
-// All update requests from the Leads sheet target this single site.
+// Hardcoded HB site ID for Sheets-originated flows (lookup + updateClient).
 const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
+
+const MB_BASE = "https://api.mindbodyonline.com/public/v6";
+
+/* ---------- Crypto / auth helpers ---------- */
 
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
@@ -64,6 +67,8 @@ function verifySheetsSecret(req: Request) {
   return { ok: true };
 }
 
+/* ---------- Generic helpers ---------- */
+
 function normalize(s: string) {
   return s
     .toLowerCase()
@@ -74,6 +79,20 @@ function normalize(s: string) {
 
 function slugifyStudioName(s: string) {
   return normalize(s).replace(/[^a-z0-9]+/g, "");
+}
+
+function digitsOnly(s: string) {
+  return (s || "").replace(/\D/g, "");
+}
+
+function phonesMatch(a: string, b: string) {
+  const da = digitsOnly(a);
+  const db = digitsOnly(b);
+  if (!da || !db) return false;
+  // Compare last 10 digits to ignore +1 / country-code differences.
+  const tailA = da.slice(-10);
+  const tailB = db.slice(-10);
+  return tailA.length === 10 && tailA === tailB;
 }
 
 function makeDummyPhone(seed: string) {
@@ -88,21 +107,39 @@ function makeDummyEmail(seed: string) {
   return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
 }
 
+function unauthorized(reason: string) {
+  return NextResponse.json(
+    { ok: false, error: `Unauthorized: ${reason}` },
+    { status: 401 }
+  );
+}
+
+function badRequest(error: string, extra?: Record<string, unknown>) {
+  return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 400 });
+}
+
+function serverError(error: string, extra?: Record<string, unknown>) {
+  return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 500 });
+}
+
+/* ---------- Typeform payload extraction ---------- */
+
 function getAnswerValue(answer: any) {
   if (!answer) return null;
 
-  if (answer.type === "text") return answer.text ?? null;
-  if (answer.type === "email") return answer.email ?? null;
-  if (answer.type === "phone_number") return answer.phone_number ?? null;
-  if (answer.type === "choice") return answer.choice?.label ?? null;
-  if (answer.type === "choices") return answer.choices?.labels?.join(", ") ?? null;
-  if (answer.type === "dropdown") return answer.dropdown?.label ?? null;
-  if (answer.type === "boolean") return String(answer.boolean);
-  if (answer.type === "number") return String(answer.number);
-  if (answer.type === "url") return answer.url ?? null;
-  if (answer.type === "date") return answer.date ?? null;
-
-  return null;
+  switch (answer.type) {
+    case "text": return answer.text ?? null;
+    case "email": return answer.email ?? null;
+    case "phone_number": return answer.phone_number ?? null;
+    case "choice": return answer.choice?.label ?? null;
+    case "choices": return answer.choices?.labels?.join(", ") ?? null;
+    case "dropdown": return answer.dropdown?.label ?? null;
+    case "boolean": return String(answer.boolean);
+    case "number": return String(answer.number);
+    case "url": return answer.url ?? null;
+    case "date": return answer.date ?? null;
+    default: return null;
+  }
 }
 
 function extractLead(payload: any) {
@@ -140,8 +177,7 @@ function extractLead(payload: any) {
   const findByTitleIncludes = (patterns: string[]) => {
     for (const answer of answers) {
       const title = normalize(getTitle(answer));
-      const matched = patterns.some((p) => title.includes(normalize(p)));
-      if (matched) {
+      if (patterns.some((p) => title.includes(normalize(p)))) {
         const value = getAnswerValue(answer);
         if (value && value.toString().trim()) return value.toString().trim();
       }
@@ -191,13 +227,8 @@ function extractLead(payload: any) {
     ]) ||
     null;
 
-  if (!firstName) {
-    firstName = findByTitleIncludes(["first name", "firstname"]) ?? "";
-  }
-
-  if (!lastName) {
-    lastName = findByTitleIncludes(["last name", "lastname"]) ?? "";
-  }
+  if (!firstName) firstName = findByTitleIncludes(["first name", "firstname"]) ?? "";
+  if (!lastName) lastName = findByTitleIncludes(["last name", "lastname"]) ?? "";
 
   if (!email) {
     const a = answers.find((x) => x?.type === "email");
@@ -234,6 +265,8 @@ function extractLead(payload: any) {
   };
 }
 
+/* ---------- DB ---------- */
+
 async function ensureTables() {
   if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
     throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
@@ -264,17 +297,10 @@ async function ensureTables() {
   `;
 
   try {
-    await sql`
-      alter table processed_submissions_v2
-      add column if not exists attribution text
-    `;
+    await sql`alter table processed_submissions_v2 add column if not exists attribution text`;
   } catch {}
-
   try {
-    await sql`
-      alter table processed_submissions_v2
-      add column if not exists attribution_type text
-    `;
+    await sql`alter table processed_submissions_v2 add column if not exists attribution_type text`;
   } catch {}
 }
 
@@ -291,7 +317,7 @@ async function getStudioMapping(studioName: string) {
   return (rows as any)?.[0] ?? null;
 }
 
-/* ---------- Sheets -> Mindbody UpdateClient ---------- */
+/* ---------- Mindbody helpers ---------- */
 
 async function getMindbodyStaffToken(siteId: number) {
   const apiKey = process.env.MINDBODY_API_KEY;
@@ -304,21 +330,15 @@ async function getMindbodyStaffToken(siteId: number) {
     );
   }
 
-  const res = await fetch(
-    "https://api.mindbodyonline.com/public/v6/usertoken/issue",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Api-Key": apiKey,
-        SiteId: String(siteId)
-      },
-      body: JSON.stringify({
-        Username: staffUsername,
-        Password: staffPassword
-      })
-    }
-  );
+  const res = await fetch(`${MB_BASE}/usertoken/issue`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Api-Key": apiKey,
+      SiteId: String(siteId)
+    },
+    body: JSON.stringify({ Username: staffUsername, Password: staffPassword })
+  });
 
   const text = await res.text();
   if (!res.ok) {
@@ -332,56 +352,35 @@ async function getMindbodyStaffToken(siteId: number) {
   return String(data.AccessToken);
 }
 
-async function callMindbodyUpdateClient(
+type MbResult = { status: number; ok: boolean; data: any; text: string };
+
+async function mindbodyFetch(
   siteId: number,
-  client: {
-    mbClientId: string;
-    firstName?: string;
-    lastName?: string;
-    referredBy?: string;
-    salesRep?: string | number;
-  }
-) {
+  path: string,
+  init: { method: "GET" | "POST"; body?: any; query?: Record<string, string> }
+): Promise<MbResult> {
   const apiKey = process.env.MINDBODY_API_KEY;
   if (!apiKey) throw new Error("Missing MINDBODY_API_KEY");
 
   const token = await getMindbodyStaffToken(siteId);
 
-  const clientBody: any = {
-    Id: client.mbClientId
-  };
-
-  // FirstName / LastName are required by Mindbody's UpdateClient request
-  // body even when they aren't changing. We pass them through from the sheet.
-  if (client.firstName) clientBody.FirstName = client.firstName;
-  if (client.lastName) clientBody.LastName = client.lastName;
-
-  if (client.referredBy) clientBody.ReferredBy = client.referredBy;
-
-  if (client.salesRep) {
-    const repId = Number(client.salesRep);
-    if (Number.isFinite(repId) && repId > 0) {
-      // SalesReps[0] is "Rep 1" on the Mindbody client profile.
-      clientBody.SalesReps = [{ Id: repId }];
+  const url = new URL(`${MB_BASE}${path}`);
+  if (init.query) {
+    for (const [k, v] of Object.entries(init.query)) {
+      url.searchParams.set(k, v);
     }
   }
 
-  const res = await fetch(
-    "https://api.mindbodyonline.com/public/v6/client/updateclient",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Api-Key": apiKey,
-        SiteId: String(siteId),
-        Authorization: token
-      },
-      body: JSON.stringify({
-        Client: clientBody,
-        CrossRegionalUpdate: false
-      })
-    }
-  );
+  const res = await fetch(url.toString(), {
+    method: init.method,
+    headers: {
+      "Content-Type": "application/json",
+      "Api-Key": apiKey,
+      SiteId: String(siteId),
+      Authorization: token
+    },
+    body: init.body ? JSON.stringify(init.body) : undefined
+  });
 
   const text = await res.text();
   let data: any = null;
@@ -392,30 +391,159 @@ async function callMindbodyUpdateClient(
   return { status: res.status, ok: res.ok, data, text };
 }
 
-async function handleSheetsUpdateClient(req: Request, payload: any) {
-  const auth = verifySheetsSecret(req);
-  if (!auth.ok) {
-    return NextResponse.json(
-      { ok: false, error: `Unauthorized: ${auth.reason}` },
-      { status: 401 }
-    );
+async function mindbodyGetClientsBySearch(siteId: number, searchText: string) {
+  return mindbodyFetch(siteId, "/client/clients", {
+    method: "GET",
+    query: {
+      "request.searchText": searchText,
+      "request.limit": "20",
+      "request.offset": "0",
+      "request.includeInactive": "true"
+    }
+  });
+}
+
+async function mindbodyUpdateClient(
+  siteId: number,
+  client: {
+    mbClientId: string;
+    firstName?: string;
+    lastName?: string;
+    referredBy?: string;
+    salesRep?: string | number;
+  }
+) {
+  const clientBody: any = { Id: client.mbClientId };
+
+  // FirstName / LastName are required by Mindbody's UpdateClient request body
+  // even when they aren't changing. We pass them through from the sheet.
+  if (client.firstName) clientBody.FirstName = client.firstName;
+  if (client.lastName) clientBody.LastName = client.lastName;
+  if (client.referredBy) clientBody.ReferredBy = client.referredBy;
+
+  if (client.salesRep) {
+    const repId = Number(client.salesRep);
+    if (Number.isFinite(repId) && repId > 0) {
+      // SalesReps[0] is "Rep 1" on the Mindbody client profile.
+      clientBody.SalesReps = [{ Id: repId }];
+    }
   }
 
+  return mindbodyFetch(siteId, "/client/updateclient", {
+    method: "POST",
+    body: { Client: clientBody, CrossRegionalUpdate: false }
+  });
+}
+
+/* ---------- Sheets -> Mindbody: lookup by phone ---------- */
+
+async function handleSheetsLookup(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+
   if (!HB_SITE_ID) {
-    return NextResponse.json(
-      { ok: false, error: "Missing MINDBODY_HB_SITE_ID on server" },
-      { status: 500 }
+    return serverError("Missing MINDBODY_SITE_ID_HB on server");
+  }
+
+  const lead = payload?.lead ?? {};
+  const phone = digitsOnly(String(lead?.phone || ""));
+  if (!phone) return badRequest("Missing lead.phone");
+
+  console.log("sheets lookup request", {
+    rowNumber: payload?.rowNumber,
+    backfill: !!payload?.backfill,
+    phoneDigits: phone,
+    siteId: HB_SITE_ID
+  });
+
+  try {
+    // Try last 10 digits first, then the full string. Dedupe with a Set.
+    const searchCandidates = Array.from(
+      new Set([phone.slice(-10), phone].filter(Boolean))
     );
+
+    let matched: any = null;
+    let lastResult: MbResult | null = null;
+
+    for (const searchText of searchCandidates) {
+      const result = await mindbodyGetClientsBySearch(HB_SITE_ID, searchText);
+      lastResult = result;
+
+      if (!result.ok) {
+        console.log("mindbody getClients non-OK", {
+          status: result.status,
+          bodySample: result.text?.slice(0, 300)
+        });
+        continue;
+      }
+
+      const clients: any[] = result.data?.Clients ?? [];
+      console.log("mindbody getClients returned", {
+        searchText,
+        count: clients.length
+      });
+
+      // SearchText can match name/email too, so verify the phone explicitly.
+      const phoneMatches = clients.filter((c) => {
+        const candidates = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
+        return candidates.some((p: string) => phonesMatch(p, phone));
+      });
+
+      if (phoneMatches.length === 1) {
+        matched = phoneMatches[0];
+        break;
+      }
+
+      if (phoneMatches.length > 1) {
+        return NextResponse.json({
+          ok: true,
+          status: "ambiguous",
+          message: `Multiple Mindbody clients matched phone ${phone}`,
+          count: phoneMatches.length
+        });
+      }
+    }
+
+    if (matched?.Id) {
+      return NextResponse.json({
+        ok: true,
+        status: "found",
+        mbClientId: String(matched.Id),
+        siteId: HB_SITE_ID
+      });
+    }
+
+    if (lastResult && !lastResult.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Mindbody getClients failed: ${lastResult.status}`,
+          mindbody: lastResult.data ?? lastResult.text
+        },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, status: "not_found" });
+  } catch (err: any) {
+    console.log("sheets lookup error", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "Lookup failed");
+  }
+}
+
+/* ---------- Sheets -> Mindbody: updateClient ---------- */
+
+async function handleSheetsUpdateClient(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+
+  if (!HB_SITE_ID) {
+    return serverError("Missing MINDBODY_SITE_ID_HB on server");
   }
 
   const client = payload?.client ?? {};
   const mbClientId = String(client?.mbClientId || "").trim();
-  if (!mbClientId) {
-    return NextResponse.json(
-      { ok: false, error: "Missing client.mbClientId" },
-      { status: 400 }
-    );
-  }
+  if (!mbClientId) return badRequest("Missing client.mbClientId");
 
   const firstName = String(client?.firstName || "").trim();
   const lastName = String(client?.lastName || "").trim();
@@ -423,10 +551,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   const salesRepRaw = client?.salesRep;
 
   if (!referredBy && !salesRepRaw) {
-    return NextResponse.json(
-      { ok: false, error: "Nothing to update (referredBy and salesRep both empty)" },
-      { status: 400 }
-    );
+    return badRequest("Nothing to update (referredBy and salesRep both empty)");
   }
 
   console.log("sheets updateClient request", {
@@ -439,7 +564,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   });
 
   try {
-    const result = await callMindbodyUpdateClient(HB_SITE_ID, {
+    const result = await mindbodyUpdateClient(HB_SITE_ID, {
       mbClientId,
       firstName,
       lastName,
@@ -472,12 +597,198 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       mindbody: result.data
     });
   } catch (err: any) {
-    console.log("sheets updateClient error", {
-      message: err?.message,
-      stack: err?.stack
+    console.log("sheets updateClient error", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "Update failed");
+  }
+}
+
+/* ---------- Typeform handler ---------- */
+
+async function handleTypeform(req: Request, rawBody: string) {
+  const verification = await verifyTypeform(req, rawBody);
+  console.log("verification result:", verification);
+
+  if (!verification.ok) {
+    return unauthorized("Typeform verification failed");
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (parseErr) {
+    console.log("payload parse failed:", parseErr);
+    return badRequest("Invalid JSON");
+  }
+
+  const lead = extractLead(payload);
+
+  console.log("lead extracted:", {
+    formId: lead.formId,
+    token: lead.token,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: lead.email,
+    phone: lead.phone,
+    studioName: lead.studioName,
+    attribution: lead.attribution,
+    attributionType: lead.attributionType,
+    answersCount: lead.answersCount
+  });
+
+  if (!lead.formId || !lead.token || lead.answersCount === 0) {
+    return NextResponse.json({ ok: true, status: "typeform_test_ok" });
+  }
+
+  const baseExtracted = {
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: lead.email,
+    phone: lead.phone,
+    studioName: lead.studioName,
+    attribution: lead.attribution,
+    attributionType: lead.attributionType
+  };
+
+  if (!lead.firstName || !lead.lastName) {
+    return badRequest("Missing firstName or lastName from Typeform payload", {
+      extracted: baseExtracted
     });
+  }
+  if (!lead.studioName) {
+    return badRequest("Missing studioName from Typeform payload", {
+      extracted: baseExtracted
+    });
+  }
+  if (!lead.attribution) {
+    return badRequest("Missing attribution from Typeform payload", {
+      extracted: baseExtracted
+    });
+  }
+
+  await ensureTables();
+
+  const mapping = await getStudioMapping(lead.studioName);
+  console.log("studio mapping result:", mapping);
+
+  if (!mapping || mapping.is_active === false) {
+    return NextResponse.json({
+      ok: true,
+      status: "routed",
+      routedTo: null,
+      message: "No active site mapping for this studio",
+      studioName: lead.studioName,
+      studioKey: slugifyStudioName(lead.studioName),
+      attribution: lead.attribution,
+      attributionType: lead.attributionType
+    });
+  }
+
+  const siteId = Number(mapping.site_id);
+
+  try {
+    await sql`
+      insert into processed_submissions_v2 (
+        typeform_token, form_id, studio_name, site_id, attribution, attribution_type
+      )
+      values (
+        ${lead.token},
+        ${lead.formId ?? null},
+        ${lead.studioName},
+        ${siteId},
+        ${lead.attribution},
+        ${lead.attributionType}
+      )
+    `;
+    console.log("inserted processed submission", {
+      token: lead.token,
+      studioName: lead.studioName,
+      siteId
+    });
+  } catch (insertErr) {
+    console.log("processed submission insert failed, likely deduped:", insertErr);
+    return NextResponse.json({
+      ok: true,
+      status: "deduped",
+      routedTo: { studioName: mapping.studio_name, siteId },
+      attribution: lead.attribution,
+      attributionType: lead.attributionType
+    });
+  }
+
+  const normalizedEmail =
+    lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
+  const normalizedPhoneRaw =
+    lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
+  const normalizedPhone = digitsOnly(normalizedPhoneRaw);
+
+  console.log("about to search/create in MB", {
+    siteId,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: normalizedEmail,
+    phone: normalizedPhone
+  });
+
+  try {
+    const existing = await findClient(siteId, {
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+      email: normalizedEmail,
+      phone: normalizedPhone
+    });
+
+    if (existing?.Id) {
+      return NextResponse.json({
+        ok: true,
+        status: "exists",
+        mbClientId: String(existing.Id),
+        routedTo: { studioName: mapping.studio_name, siteId },
+        attribution: lead.attribution,
+        attributionType: lead.attributionType,
+        fallbacksUsed: {
+          emailWasFallback: !lead.email,
+          phoneWasFallback: !lead.phone
+        }
+      });
+    }
+
+    const created = await createClient(siteId, {
+      firstName: lead.firstName,
+      lastName: lead.lastName,
+      email: normalizedEmail,
+      phone: normalizedPhone
+    });
+
+    if (!created?.Id) return serverError("Mindbody create failed");
+
+    return NextResponse.json({
+      ok: true,
+      status: "created",
+      mbClientId: String(created.Id),
+      routedTo: { studioName: mapping.studio_name, siteId },
+      attribution: lead.attribution,
+      attributionType: lead.attributionType,
+      fallbacksUsed: {
+        emailWasFallback: !lead.email,
+        phoneWasFallback: !lead.phone
+      }
+    });
+  } catch (err: any) {
+    const status = err?.response?.status ?? null;
+    const data = err?.response?.data ?? null;
+    const where = typeof err?.config?.url === "string" ? err.config.url : null;
+
+    console.log("mindbody error:", { status, where, data });
+
     return NextResponse.json(
-      { ok: false, error: err?.message ?? "Update failed" },
+      {
+        ok: false,
+        error: err?.message ?? "Server error",
+        mindbody: { status, where, data },
+        routedTo: { studioName: mapping.studio_name, siteId },
+        attribution: lead.attribution,
+        attributionType: lead.attributionType
+      },
       { status: 500 }
     );
   }
@@ -487,14 +798,17 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
 
 export async function POST(req: Request) {
   try {
-    console.log("🔥 webhook-v2 hit");
+    console.log("🔥 webhook hit");
     console.log("env check:", {
       hasDatabaseUrlV2: !!process.env.DATABASE_URL_V2,
       hasDatabaseUrl: !!process.env.DATABASE_URL,
       hasTypeformSecret: !!process.env.TYPEFORM_WEBHOOK_SECRET,
       hasSheetsSecret: !!process.env.SHEETS_WEBHOOK_SECRET,
       hasHbSiteId: !!HB_SITE_ID,
-      hasStaffCreds: !!(process.env.MINDBODY_STAFF_USERNAME && process.env.MINDBODY_STAFF_PASSWORD),
+      hasApiKey: !!process.env.MINDBODY_API_KEY,
+      hasStaffCreds: !!(
+        process.env.MINDBODY_STAFF_USERNAME && process.env.MINDBODY_STAFF_PASSWORD
+      ),
       nodeEnv: process.env.NODE_ENV
     });
 
@@ -506,270 +820,20 @@ export async function POST(req: Request) {
     try {
       earlyPayload = JSON.parse(rawBody);
     } catch {
-      // Not JSON yet — let the Typeform path handle the error below.
+      // Not JSON — let the Typeform path return the appropriate error below.
     }
 
-    if (earlyPayload && earlyPayload.updateClient === true) {
+    if (earlyPayload?.lookupOnly === true) {
+      return await handleSheetsLookup(req, earlyPayload);
+    }
+
+    if (earlyPayload?.updateClient === true) {
       return await handleSheetsUpdateClient(req, earlyPayload);
     }
 
-    const verification = await verifyTypeform(req, rawBody);
-    console.log("verification result:", verification);
-
-    if (!verification.ok) {
-      return NextResponse.json(
-        { ok: false, error: "Unauthorized (Typeform verification failed)" },
-        { status: 401 }
-      );
-    }
-
-    let payload: any;
-    try {
-      payload = JSON.parse(rawBody);
-      console.log("payload parsed successfully");
-    } catch (parseErr) {
-      console.log("payload parse failed:", parseErr);
-      return NextResponse.json({ ok: false, error: "Invalid JSON" }, { status: 400 });
-    }
-
-    const lead = extractLead(payload);
-
-    console.log("lead extracted:", {
-      formId: lead.formId,
-      token: lead.token,
-      firstName: lead.firstName,
-      lastName: lead.lastName,
-      email: lead.email,
-      phone: lead.phone,
-      studioName: lead.studioName,
-      attribution: lead.attribution,
-      attributionType: lead.attributionType,
-      answersCount: lead.answersCount
-    });
-
-    if (!lead.formId || !lead.token || lead.answersCount === 0) {
-      return NextResponse.json({ ok: true, status: "typeform_test_ok" });
-    }
-
-    if (!lead.firstName || !lead.lastName) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Missing firstName or lastName from Typeform payload",
-          extracted: {
-            firstName: lead.firstName,
-            lastName: lead.lastName,
-            email: lead.email,
-            phone: lead.phone,
-            studioName: lead.studioName,
-            attribution: lead.attribution,
-            attributionType: lead.attributionType
-          }
-        },
-        { status: 400 }
-      );
-    }
-
-    if (!lead.studioName) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Missing studioName from Typeform payload",
-          extracted: {
-            firstName: lead.firstName,
-            lastName: lead.lastName,
-            email: lead.email,
-            phone: lead.phone,
-            attribution: lead.attribution,
-            attributionType: lead.attributionType
-          }
-        },
-        { status: 400 }
-      );
-    }
-
-    if (!lead.attribution) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Missing attribution from Typeform payload",
-          extracted: {
-            firstName: lead.firstName,
-            lastName: lead.lastName,
-            email: lead.email,
-            phone: lead.phone,
-            studioName: lead.studioName,
-            attribution: lead.attribution,
-            attributionType: lead.attributionType
-          }
-        },
-        { status: 400 }
-      );
-    }
-
-    console.log("before ensureTables");
-    await ensureTables();
-    console.log("after ensureTables");
-
-    const mapping = await getStudioMapping(lead.studioName);
-    console.log("studio mapping result:", mapping);
-
-    if (!mapping || mapping.is_active === false) {
-      return NextResponse.json({
-        ok: true,
-        status: "routed",
-        routedTo: null,
-        message: "No active site mapping for this studio",
-        studioName: lead.studioName,
-        studioKey: slugifyStudioName(lead.studioName),
-        attribution: lead.attribution,
-        attributionType: lead.attributionType
-      });
-    }
-
-    const siteId = Number(mapping.site_id);
-
-    try {
-      await sql`
-        insert into processed_submissions_v2 (
-          typeform_token,
-          form_id,
-          studio_name,
-          site_id,
-          attribution,
-          attribution_type
-        )
-        values (
-          ${lead.token},
-          ${lead.formId ?? null},
-          ${lead.studioName},
-          ${siteId},
-          ${lead.attribution},
-          ${lead.attributionType}
-        )
-      `;
-
-      console.log("inserted processed submission", {
-        token: lead.token,
-        studioName: lead.studioName,
-        siteId,
-        attribution: lead.attribution,
-        attributionType: lead.attributionType
-      });
-    } catch (insertErr) {
-      console.log("processed submission insert failed, likely deduped:", insertErr);
-      return NextResponse.json({
-        ok: true,
-        status: "deduped",
-        routedTo: { studioName: mapping.studio_name, siteId },
-        attribution: lead.attribution,
-        attributionType: lead.attributionType
-      });
-    }
-
-    const normalizedEmail =
-      lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
-
-    const normalizedPhoneRaw =
-      lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
-
-    const normalizedPhone = normalizedPhoneRaw.replace(/\D/g, "");
-
-    console.log("about to search/create in MB", {
-      siteId,
-      firstName: lead.firstName,
-      lastName: lead.lastName,
-      email: normalizedEmail,
-      phone: normalizedPhone,
-      attribution: lead.attribution,
-      attributionType: lead.attributionType
-    });
-
-    try {
-      const existing = await findClient(siteId, {
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        email: normalizedEmail,
-        phone: normalizedPhone
-      });
-
-      console.log("existing MB client result:", existing);
-
-      if (existing?.Id) {
-        return NextResponse.json({
-          ok: true,
-          status: "exists",
-          mbClientId: String(existing.Id),
-          routedTo: { studioName: mapping.studio_name, siteId },
-          attribution: lead.attribution,
-          attributionType: lead.attributionType,
-          fallbacksUsed: {
-            emailWasFallback: !lead.email,
-            phoneWasFallback: !lead.phone
-          }
-        });
-      }
-
-      const created = await createClient(siteId, {
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        email: normalizedEmail,
-        phone: normalizedPhone
-      });
-
-      console.log("created MB client result:", created);
-
-      if (!created?.Id) {
-        return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
-      }
-
-      return NextResponse.json({
-        ok: true,
-        status: "created",
-        mbClientId: String(created.Id),
-        routedTo: { studioName: mapping.studio_name, siteId },
-        attribution: lead.attribution,
-        attributionType: lead.attributionType,
-        fallbacksUsed: {
-          emailWasFallback: !lead.email,
-          phoneWasFallback: !lead.phone
-        }
-      });
-    } catch (err: any) {
-      const status = err?.response?.status ?? null;
-      const data = err?.response?.data ?? null;
-      const where = typeof err?.config?.url === "string" ? err.config.url : null;
-
-      console.log("mindbody error:", {
-        status,
-        where,
-        data
-      });
-
-      return NextResponse.json(
-        {
-          ok: false,
-          error: err?.message ?? "Server error",
-          mindbody: { status, where, data },
-          routedTo: { studioName: mapping.studio_name, siteId },
-          attribution: lead.attribution,
-          attributionType: lead.attributionType
-        },
-        { status: 500 }
-      );
-    }
+    return await handleTypeform(req, rawBody);
   } catch (err: any) {
-    console.log("top-level webhook-v2 error:", {
-      message: err?.message,
-      stack: err?.stack
-    });
-
-    return NextResponse.json(
-      {
-        ok: false,
-        error: err?.message ?? "Unhandled server error"
-      },
-      { status: 500 }
-    );
+    console.log("top-level webhook error:", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "Unhandled server error");
   }
 }
