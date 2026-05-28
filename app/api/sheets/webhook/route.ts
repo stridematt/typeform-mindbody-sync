@@ -14,7 +14,7 @@ const FALLBACK_PHONE_PREFIX = "555";
 
 // Hardcoded HB site ID for the Sheets -> updateClient flow.
 // All update requests from the Leads sheet target this single site.
-const HB_SITE_ID = Number(process.env.MINDBODY_HB_SITE_ID || 0);
+const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
 
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
@@ -295,12 +295,12 @@ async function getStudioMapping(studioName: string) {
 
 async function getMindbodyStaffToken(siteId: number) {
   const apiKey = process.env.MINDBODY_API_KEY;
-  const sourceName = process.env.MINDBODY_SOURCE_NAME;
-  const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD;
+  const staffUsername = process.env.MINDBODY_STAFF_USERNAME;
+  const staffPassword = process.env.MINDBODY_STAFF_PASSWORD;
 
-  if (!apiKey || !sourceName || !sourcePassword) {
+  if (!apiKey || !staffUsername || !staffPassword) {
     throw new Error(
-      "Missing MINDBODY_API_KEY / MINDBODY_SOURCE_NAME / MINDBODY_SOURCE_PASSWORD"
+      "Missing MINDBODY_API_KEY / MINDBODY_STAFF_USERNAME / MINDBODY_STAFF_PASSWORD"
     );
   }
 
@@ -314,8 +314,8 @@ async function getMindbodyStaffToken(siteId: number) {
         SiteId: String(siteId)
       },
       body: JSON.stringify({
-        Username: sourceName,
-        Password: sourcePassword
+        Username: staffUsername,
+        Password: staffPassword
       })
     }
   );
@@ -494,6 +494,7 @@ export async function POST(req: Request) {
       hasTypeformSecret: !!process.env.TYPEFORM_WEBHOOK_SECRET,
       hasSheetsSecret: !!process.env.SHEETS_WEBHOOK_SECRET,
       hasHbSiteId: !!HB_SITE_ID,
+      hasStaffCreds: !!(process.env.MINDBODY_STAFF_USERNAME && process.env.MINDBODY_STAFF_PASSWORD),
       nodeEnv: process.env.NODE_ENV
     });
 
