@@ -12,10 +12,6 @@ const sql = neon(
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 
-// Hardcoded HB site ID for the Sheets -> updateClient flow.
-// All update requests from the Leads sheet target this single site.
-const HB_SITE_ID = Number(process.env.MINDBODY_HB_SITE_ID || 0);
-
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
@@ -48,20 +44,6 @@ async function verifyTypeform(req: Request, rawBody: string) {
   if (headerSecret && headerSecret === secret) return { ok: true };
 
   return { ok: false };
-}
-
-function verifySheetsSecret(req: Request) {
-  const secret = process.env.SHEETS_WEBHOOK_SECRET;
-  if (!secret) return { ok: false, reason: "Missing SHEETS_WEBHOOK_SECRET on server" };
-
-  const provided =
-    req.headers.get("x-sheets-secret") || req.headers.get("X-Sheets-Secret");
-  if (!provided) return { ok: false, reason: "Missing x-sheets-secret header" };
-
-  if (provided.length !== secret.length) return { ok: false, reason: "Bad secret" };
-  if (!timingSafeEqual(provided, secret)) return { ok: false, reason: "Bad secret" };
-
-  return { ok: true };
 }
 
 function normalize(s: string) {
@@ -291,200 +273,6 @@ async function getStudioMapping(studioName: string) {
   return (rows as any)?.[0] ?? null;
 }
 
-/* ---------- Sheets -> Mindbody UpdateClient ---------- */
-
-async function getMindbodyStaffToken(siteId: number) {
-  const apiKey = process.env.MINDBODY_API_KEY;
-  const sourceName = process.env.MINDBODY_SOURCE_NAME;
-  const sourcePassword = process.env.MINDBODY_SOURCE_PASSWORD;
-
-  if (!apiKey || !sourceName || !sourcePassword) {
-    throw new Error(
-      "Missing MINDBODY_API_KEY / MINDBODY_SOURCE_NAME / MINDBODY_SOURCE_PASSWORD"
-    );
-  }
-
-  const res = await fetch(
-    "https://api.mindbodyonline.com/public/v6/usertoken/issue",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Api-Key": apiKey,
-        SiteId: String(siteId)
-      },
-      body: JSON.stringify({
-        Username: sourceName,
-        Password: sourcePassword
-      })
-    }
-  );
-
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Mindbody usertoken/issue failed: ${res.status} ${text}`);
-  }
-
-  const data = JSON.parse(text);
-  if (!data?.AccessToken) {
-    throw new Error(`Mindbody usertoken/issue returned no AccessToken: ${text}`);
-  }
-  return String(data.AccessToken);
-}
-
-async function callMindbodyUpdateClient(
-  siteId: number,
-  client: {
-    mbClientId: string;
-    firstName?: string;
-    lastName?: string;
-    referredBy?: string;
-    salesRep?: string | number;
-  }
-) {
-  const apiKey = process.env.MINDBODY_API_KEY;
-  if (!apiKey) throw new Error("Missing MINDBODY_API_KEY");
-
-  const token = await getMindbodyStaffToken(siteId);
-
-  const clientBody: any = {
-    Id: client.mbClientId
-  };
-
-  // FirstName / LastName are required by Mindbody's UpdateClient request
-  // body even when they aren't changing. We pass them through from the sheet.
-  if (client.firstName) clientBody.FirstName = client.firstName;
-  if (client.lastName) clientBody.LastName = client.lastName;
-
-  if (client.referredBy) clientBody.ReferredBy = client.referredBy;
-
-  if (client.salesRep) {
-    const repId = Number(client.salesRep);
-    if (Number.isFinite(repId) && repId > 0) {
-      // SalesReps[0] is "Rep 1" on the Mindbody client profile.
-      clientBody.SalesReps = [{ Id: repId }];
-    }
-  }
-
-  const res = await fetch(
-    "https://api.mindbodyonline.com/public/v6/client/updateclient",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Api-Key": apiKey,
-        SiteId: String(siteId),
-        Authorization: token
-      },
-      body: JSON.stringify({
-        Client: clientBody,
-        CrossRegionalUpdate: false
-      })
-    }
-  );
-
-  const text = await res.text();
-  let data: any = null;
-  try {
-    data = JSON.parse(text);
-  } catch {}
-
-  return { status: res.status, ok: res.ok, data, text };
-}
-
-async function handleSheetsUpdateClient(req: Request, payload: any) {
-  const auth = verifySheetsSecret(req);
-  if (!auth.ok) {
-    return NextResponse.json(
-      { ok: false, error: `Unauthorized: ${auth.reason}` },
-      { status: 401 }
-    );
-  }
-
-  if (!HB_SITE_ID) {
-    return NextResponse.json(
-      { ok: false, error: "Missing MINDBODY_HB_SITE_ID on server" },
-      { status: 500 }
-    );
-  }
-
-  const client = payload?.client ?? {};
-  const mbClientId = String(client?.mbClientId || "").trim();
-  if (!mbClientId) {
-    return NextResponse.json(
-      { ok: false, error: "Missing client.mbClientId" },
-      { status: 400 }
-    );
-  }
-
-  const firstName = String(client?.firstName || "").trim();
-  const lastName = String(client?.lastName || "").trim();
-  const referredBy = String(client?.referredBy || "").trim();
-  const salesRepRaw = client?.salesRep;
-
-  if (!referredBy && !salesRepRaw) {
-    return NextResponse.json(
-      { ok: false, error: "Nothing to update (referredBy and salesRep both empty)" },
-      { status: 400 }
-    );
-  }
-
-  console.log("sheets updateClient request", {
-    rowNumber: payload?.rowNumber,
-    mbClientId,
-    hasFirstName: !!firstName,
-    hasLastName: !!lastName,
-    referredBy: referredBy || null,
-    salesRep: salesRepRaw || null
-  });
-
-  try {
-    const result = await callMindbodyUpdateClient(HB_SITE_ID, {
-      mbClientId,
-      firstName,
-      lastName,
-      referredBy: referredBy || undefined,
-      salesRep: salesRepRaw || undefined
-    });
-
-    console.log("mindbody updateClient result", {
-      status: result.status,
-      ok: result.ok,
-      bodySample: result.text?.slice(0, 300)
-    });
-
-    if (!result.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error: `Mindbody updateClient failed: ${result.status}`,
-          mindbody: result.data ?? result.text
-        },
-        { status: 502 }
-      );
-    }
-
-    return NextResponse.json({
-      ok: true,
-      status: "updated",
-      mbClientId,
-      siteId: HB_SITE_ID,
-      mindbody: result.data
-    });
-  } catch (err: any) {
-    console.log("sheets updateClient error", {
-      message: err?.message,
-      stack: err?.stack
-    });
-    return NextResponse.json(
-      { ok: false, error: err?.message ?? "Update failed" },
-      { status: 500 }
-    );
-  }
-}
-
-/* ---------- POST entrypoint ---------- */
-
 export async function POST(req: Request) {
   try {
     console.log("🔥 webhook-v2 hit");
@@ -492,25 +280,11 @@ export async function POST(req: Request) {
       hasDatabaseUrlV2: !!process.env.DATABASE_URL_V2,
       hasDatabaseUrl: !!process.env.DATABASE_URL,
       hasTypeformSecret: !!process.env.TYPEFORM_WEBHOOK_SECRET,
-      hasSheetsSecret: !!process.env.SHEETS_WEBHOOK_SECRET,
-      hasHbSiteId: !!HB_SITE_ID,
       nodeEnv: process.env.NODE_ENV
     });
 
     const rawBody = await req.text();
     console.log("raw body length:", rawBody.length);
-
-    // Peek at the body to route Sheets requests before Typeform verification.
-    let earlyPayload: any = null;
-    try {
-      earlyPayload = JSON.parse(rawBody);
-    } catch {
-      // Not JSON yet — let the Typeform path handle the error below.
-    }
-
-    if (earlyPayload && earlyPayload.updateClient === true) {
-      return await handleSheetsUpdateClient(req, earlyPayload);
-    }
 
     const verification = await verifyTypeform(req, rawBody);
     console.log("verification result:", verification);
