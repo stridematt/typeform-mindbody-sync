@@ -183,6 +183,31 @@ function last10(s?: string | null) {
   return d.length > 10 ? d.slice(-10) : d;
 }
 
+// Escape visitor-supplied free text so it can't break or inject into the
+// HTML we build below. We control the <strong>/<ul>/<li> markup; anything the
+// visitor typed (story, injuries, goal names, plan focus) is escaped first.
+function esc(s?: string | null): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Build the contact-log body as HTML.
+ *
+ * NOTE: This emits literal HTML tags (<strong>, <ul>, <li>). It renders as
+ * formatted text ONLY if the Mindbody contact-log view interprets HTML. If a
+ * logged entry shows the raw tags instead, revert to a plain-text builder.
+ *
+ * Layout — each header bold, responses as bullets beneath:
+ *   Goals                     -> their story / why-now free text
+ *   Injuries                  -> injuries free text
+ *   Membership Recommendation -> recommended tier
+ *   Priorities                -> the up-to-3 goal chips from the tool
+ *   Days Per Week             -> number of days
+ *   Fitness Plan              -> day-by-day plan + recommended class formats
+ */
 function buildLogText(b: any): string {
   const tierLabel: Record<string, string> = {
     ignite: "Ignite",
@@ -190,35 +215,74 @@ function buildLogText(b: any): string {
     elite: "Elite",
   };
 
-  // Format the day-by-day plan, if present.
-  let planBlock = "";
+  // One section = bold header + a <ul> of bullet lines. Returns "" when there
+  // are no items, so an empty field never leaves a dangling header behind.
+  const section = (header: string, items: Array<string | null | undefined>): string => {
+    const clean = items.map((i) => (i ?? "").toString().trim()).filter(Boolean);
+    if (!clean.length) return "";
+    const bullets = clean.map((i) => `<li>${esc(i)}</li>`).join("");
+    return `<strong>${header}:</strong><ul>${bullets}</ul>`;
+  };
+
+  // Goals -> their story / why-now
+  const goalsSection = section("Goals", [b?.story]);
+
+  // Injuries
+  const injuriesSection = section("Injuries", [b?.injuries]);
+
+  // Membership Recommendation -> recommended tier
+  const recTier = b?.recommended_tier
+    ? tierLabel[b.recommended_tier] || String(b.recommended_tier)
+    : "";
+  const membershipSection = section("Membership Recommendation", [recTier]);
+
+  // Priorities -> top goal chips from the tool (CSV -> one bullet each)
+  const priorities = String(b?.goals_csv ?? "")
+    .split(",")
+    .map((g) => g.trim())
+    .filter(Boolean);
+  const prioritiesSection = section("Priorities", priorities);
+
+  // Days Per Week
+  const daysSection = section("Days Per Week", [
+    b?.days_per_week ? String(b.days_per_week) : "",
+  ]);
+
+  // Fitness Plan -> day-by-day rows, day name bolded then the focus + format:
+  //   <li><strong>Monday:</strong> Total Body (Pace & Press)</li>
+  // We build the <li> markup directly here (instead of via section()) so the
+  // day can be bold; the focus/format text is still escaped.
+  let planBullets = "";
   if (Array.isArray(b?.plan) && b.plan.length) {
-    const lines = b.plan.map((p: any) => {
-      const day = String(p?.day ?? "").trim();
-      const focus = String(p?.focus ?? "").trim();
-      const format = String(p?.format ?? "").trim();
-      const bits = [day && `${day}:`, focus, format && `(${format})`].filter(Boolean);
-      return `  - ${bits.join(" ")}`;
-    });
-    planBlock = `Suggested weekly plan:\n${lines.join("\n")}`;
+    planBullets = b.plan
+      .map((p: any) => {
+        const day = esc(String(p?.day ?? "").trim());
+        const focus = esc(String(p?.focus ?? "").trim());
+        const format = esc(String(p?.format ?? "").trim());
+        const rest = [focus, format && `(${format})`].filter(Boolean).join(" ");
+        if (!day && !rest) return "";
+        const dayPart = day ? `<strong>${day}:</strong>` : "";
+        return `<li>${[dayPart, rest].filter(Boolean).join(" ")}</li>`;
+      })
+      .filter(Boolean)
+      .join("");
   }
+  const planSection = planBullets
+    ? `<strong>Fitness Plan:</strong><ul>${planBullets}</ul>`
+    : "";
 
-  const recTier = b?.recommended_tier ? (tierLabel[b.recommended_tier] || String(b.recommended_tier)) : "";
+  const html = [
+    goalsSection,
+    injuriesSection,
+    membershipSection,
+    prioritiesSection,
+    daysSection,
+    planSection,
+  ]
+    .filter(Boolean)
+    .join("");
 
-  const parts = [
-    "STRIDE website — coach intake",
-    b?.studio ? `Studio: ${String(b.studio).trim()}` : null,
-    b?.goals_csv ? `Goals: ${String(b.goals_csv).trim()}` : null,
-    b?.days_csv ? `Training days: ${String(b.days_csv).trim()}` : null,
-    b?.days_per_week ? `Days per week: ${b.days_per_week}` : null,
-    b?.formats_csv ? `Formats: ${String(b.formats_csv).trim()}` : null,
-    b?.weekly_minutes ? `Weekly minutes: ${b.weekly_minutes}` : null,
-    recTier ? `Recommended membership: ${recTier}` : null,
-    planBlock || null,
-    b?.injuries ? `Anything to know (injuries/recovery):\n${String(b.injuries).trim()}` : null,
-    b?.story ? `Their story (why now / what they're chasing):\n${String(b.story).trim()}` : null,
-  ].filter(Boolean);
-  return parts.join("\n\n").slice(0, 3800);
+  return html.slice(0, 3800);
 }
 
 export async function POST(req: Request) {
