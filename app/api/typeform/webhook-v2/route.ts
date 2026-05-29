@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import { findClient, createClient } from "../../../../lib/mindbody";
+import { createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
@@ -56,6 +56,11 @@ function normalize(s: string) {
 
 function slugifyStudioName(s: string) {
   return normalize(s).replace(/[^a-z0-9]+/g, "");
+}
+
+function normalizePhoneUS(s: string | null | undefined) {
+  const d = (s || "").replace(/\D/g, "");
+  return d.length === 11 && d.startsWith("1") ? d.slice(1) : d;
 }
 
 function makeDummyPhone(seed: string) {
@@ -273,6 +278,59 @@ async function getStudioMapping(studioName: string) {
   return (rows as any)?.[0] ?? null;
 }
 
+async function findClientByPhone(siteId: number, phone: string) {
+  const target = normalizePhoneUS(phone);
+  if (!target) return null;
+
+  const apiKey = process.env.MINDBODY_API_KEY;
+  const username = process.env.MINDBODY_USERNAME;
+  const password = process.env.MINDBODY_PASSWORD;
+
+  if (!apiKey || !username || !password) {
+    throw new Error("Missing Mindbody credentials");
+  }
+
+  const tokenRes = await fetch(
+    "https://api.mindbodyonline.com/public/v6/usertoken/issue",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Api-Key": apiKey,
+        SiteId: String(siteId),
+      },
+      body: JSON.stringify({ Username: username, Password: password }),
+    }
+  );
+
+  const tokenJson = await tokenRes.json();
+  const accessToken = tokenJson?.AccessToken;
+  if (!accessToken) throw new Error("Failed to get Mindbody token");
+
+  const searchRes = await fetch(
+    `https://api.mindbodyonline.com/public/v6/client/clients?SearchText=${encodeURIComponent(target)}&Limit=50`,
+    {
+      headers: {
+        "Api-Key": apiKey,
+        Authorization: `Bearer ${accessToken}`,
+        SiteId: String(siteId),
+      },
+    }
+  );
+
+  const searchJson = await searchRes.json();
+  const clients: any[] = searchJson?.Clients ?? [];
+
+  for (const c of clients) {
+    const phones = [c.MobilePhone, c.HomePhone, c.WorkPhone]
+      .map(normalizePhoneUS)
+      .filter(Boolean);
+    if (phones.includes(target)) return c;
+  }
+
+  return null;
+}
+
 export async function POST(req: Request) {
   try {
     console.log("🔥 webhook-v2 hit");
@@ -459,12 +517,7 @@ export async function POST(req: Request) {
     });
 
     try {
-      const existing = await findClient(siteId, {
-        firstName: lead.firstName,
-        lastName: lead.lastName,
-        email: normalizedEmail,
-        phone: normalizedPhone
-      });
+      const existing = await findClientByPhone(siteId, normalizedPhone);
 
       console.log("existing MB client result:", existing);
 
