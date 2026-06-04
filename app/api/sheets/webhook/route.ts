@@ -118,17 +118,22 @@ function resolveReferralRelationshipId(
 ): { ok: true; relationshipId: number } | { ok: false; reason: string } {
   const rawKey = String(siteKey || "").trim();
 
-  const readEnv = (envName: string) => {
-    const parsed = Number(process.env[envName] || 0);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  // Mindbody system relationships use negative IDs (e.g. "Referred By" is -1),
+  // so accept any non-zero integer. Only an empty/unset env or 0 is invalid.
+  const readEnv = (envName: string): { ok: true; id: number } | { ok: false } => {
+    const raw = process.env[envName];
+    if (raw === undefined || raw === null || String(raw).trim() === "") return { ok: false };
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed === 0) return { ok: false };
+    return { ok: true, id: parsed };
   };
 
   if (!rawKey) {
     const hb = readEnv("MINDBODY_REFBY_RELATIONSHIP_ID_HB");
-    if (!hb) {
-      return { ok: false, reason: "Missing MINDBODY_REFBY_RELATIONSHIP_ID_HB (no siteKey provided)" };
+    if (!hb.ok) {
+      return { ok: false, reason: "Missing/invalid MINDBODY_REFBY_RELATIONSHIP_ID_HB (no siteKey provided)" };
     }
-    return { ok: true, relationshipId: hb };
+    return { ok: true, relationshipId: hb.id };
   }
 
   if (!/^[A-Za-z0-9_]+$/.test(rawKey)) {
@@ -136,12 +141,12 @@ function resolveReferralRelationshipId(
   }
 
   const envName = `MINDBODY_REFBY_RELATIONSHIP_ID_${rawKey.toUpperCase()}`;
-  const relationshipId = readEnv(envName);
-  if (!relationshipId) {
-    return { ok: false, reason: `Missing ${envName} on server` };
+  const rel = readEnv(envName);
+  if (!rel.ok) {
+    return { ok: false, reason: `Missing/invalid ${envName} on server` };
   }
 
-  return { ok: true, relationshipId };
+  return { ok: true, relationshipId: rel.id };
 }
 
 /* ---------- Generic helpers ---------- */
@@ -548,7 +553,10 @@ async function mindbodyAddReferralRelationship(
     ClientRelationships: [
       {
         RelatedClientId: String(args.referrerClientId),
-        Relationship: { Id: args.relationshipId }
+        Relationship: { Id: args.relationshipId },
+        // The type Id (-1) is shared by both "Referred" and "Referred By", so we
+        // pin the direction by name: the new client *was Referred By* the referrer.
+        RelationshipName: "Referred By"
       }
     ]
   };
