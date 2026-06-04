@@ -870,6 +870,69 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
   }
 }
 
+/* ---------- Sheets -> Mindbody: get client relationships (discovery) ----------
+
+   Trigger payload from Apps Script:
+     { getRelationships: true, siteKey, mbClientId }
+
+   Returns the client's relationships (type Id + both directional names) so you
+   can read off the "Referred By" Relationship.Id. Reuses mindbodyGetClientCompleteInfo. */
+
+async function handleSheetsGetRelationships(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
+
+  const mbClientId = String(payload?.mbClientId || "").trim();
+  if (!mbClientId) return badRequest("Missing mbClientId");
+
+  console.log("sheets getRelationships request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
+    mbClientId
+  });
+
+  try {
+    const info = await mindbodyGetClientCompleteInfo(siteId, mbClientId);
+    if (!info.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Mindbody clientcompleteinfo failed: ${info.status}`,
+          mindbody: info.data ?? info.text
+        },
+        { status: 502 }
+      );
+    }
+
+    const c = info.data?.Client ?? info.data ?? {};
+    const rels: any[] = c?.ClientRelationships ?? [];
+
+    const relationships = rels.map((r) => ({
+      relationshipId: r?.Relationship?.Id ?? null,
+      name1: r?.Relationship?.RelationshipName1 ?? null,
+      name2: r?.Relationship?.RelationshipName2 ?? null,
+      relatedClientId: r?.RelatedClientId ?? null,
+      relationshipName: r?.RelationshipName ?? null
+    }));
+
+    return NextResponse.json({
+      ok: true,
+      status: "relationships",
+      mbClientId,
+      siteId,
+      count: relationships.length,
+      relationships
+    });
+  } catch (err: any) {
+    console.log("sheets getRelationships error", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "Get relationships failed");
+  }
+}
+
 /* ---------- Sheets -> Mindbody: find-or-create from Paid Leads row ---------- */
 
 async function handleSheetsCreate(req: Request, payload: any) {
@@ -1204,6 +1267,10 @@ export async function POST(req: Request) {
 
     if (earlyPayload?.linkReferral === true) {
       return await handleSheetsLinkReferral(req, earlyPayload);
+    }
+
+    if (earlyPayload?.getRelationships === true) {
+      return await handleSheetsGetRelationships(req, earlyPayload);
     }
 
     // Sheets lead-capture posts from the Apps Script:
