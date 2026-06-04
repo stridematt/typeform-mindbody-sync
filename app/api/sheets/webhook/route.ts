@@ -104,6 +104,46 @@ function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: f
   return { ok: true, siteId: parsed };
 }
 
+/**
+ * Resolve a payload siteKey to the Mindbody "Referred By" relationship type ID,
+ * via MINDBODY_REFBY_RELATIONSHIP_ID_{KEY}. Mirrors resolveSiteId, including the
+ * blank-siteKey -> HB fallback.
+ *
+ * Mindbody has no endpoint that lists relationship types, so you discover the ID
+ * once per site (add the relationship in the UI, then read it back via
+ * clientcompleteinfo) and store it in these env vars.
+ */
+function resolveReferralRelationshipId(
+  siteKey: unknown
+): { ok: true; relationshipId: number } | { ok: false; reason: string } {
+  const rawKey = String(siteKey || "").trim();
+
+  const readEnv = (envName: string) => {
+    const parsed = Number(process.env[envName] || 0);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  };
+
+  if (!rawKey) {
+    const hb = readEnv("MINDBODY_REFBY_RELATIONSHIP_ID_HB");
+    if (!hb) {
+      return { ok: false, reason: "Missing MINDBODY_REFBY_RELATIONSHIP_ID_HB (no siteKey provided)" };
+    }
+    return { ok: true, relationshipId: hb };
+  }
+
+  if (!/^[A-Za-z0-9_]+$/.test(rawKey)) {
+    return { ok: false, reason: `Invalid siteKey: ${rawKey}` };
+  }
+
+  const envName = `MINDBODY_REFBY_RELATIONSHIP_ID_${rawKey.toUpperCase()}`;
+  const relationshipId = readEnv(envName);
+  if (!relationshipId) {
+    return { ok: false, reason: `Missing ${envName} on server` };
+  }
+
+  return { ok: true, relationshipId };
+}
+
 /* ---------- Generic helpers ---------- */
 
 function normalize(s: string) {
@@ -472,6 +512,53 @@ async function mindbodyUpdateClient(
   });
 }
 
+/**
+ * Read a client's full info (relationships + name). Used both for idempotency
+ * (is this referrer already linked?) and to grab the FirstName/LastName that
+ * UpdateClient requires on every write.
+ */
+async function mindbodyGetClientCompleteInfo(siteId: number, clientId: string) {
+  return mindbodyFetch(siteId, "/client/clientcompleteinfo", {
+    method: "GET",
+    query: { ClientId: clientId }
+  });
+}
+
+/**
+ * Write the "was Referred By" link onto the new client. The ClientRelationships
+ * array merges set-style, so this adds the relationship without removing existing
+ * ones. ClientRelationships cannot be written via the cross-regional path, so we
+ * keep CrossRegionalUpdate false and target the local site.
+ */
+async function mindbodyAddReferralRelationship(
+  siteId: number,
+  args: {
+    mbClientId: string;
+    firstName: string;
+    lastName: string;
+    referrerClientId: string;
+    relationshipId: number;
+  }
+) {
+  const clientBody: any = {
+    Id: args.mbClientId,
+    // Required by UpdateClient even when unchanged.
+    FirstName: args.firstName,
+    LastName: args.lastName,
+    ClientRelationships: [
+      {
+        RelatedClientId: String(args.referrerClientId),
+        Relationship: { Id: args.relationshipId }
+      }
+    ]
+  };
+
+  return mindbodyFetch(siteId, "/client/updateclient", {
+    method: "POST",
+    body: { Client: clientBody, CrossRegionalUpdate: false }
+  });
+}
+
 /* ---------- Sheets -> Mindbody: lookup by phone ---------- */
 
 async function handleSheetsLookup(req: Request, payload: any) {
@@ -639,6 +726,147 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
   } catch (err: any) {
     console.log("sheets updateClient error", { message: err?.message, stack: err?.stack });
     return serverError(err?.message ?? "Update failed");
+  }
+}
+
+/* ---------- Sheets -> Mindbody: link referral relationship ----------
+
+   Trigger payload from Apps Script:
+     { linkReferral: true, siteKey, mbClientId, referrerEmail }
+
+   Resolves the referrer by email, then writes a "was Referred By" client
+   relationship onto the new client. Reuses the same auth path as every other
+   handler (mindbodyFetch issues a token from MINDBODY_STAFF_USERNAME/PASSWORD).  */
+
+async function handleSheetsLinkReferral(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
+
+  const rel = resolveReferralRelationshipId(payload?.siteKey);
+  if (!rel.ok) return badRequest(rel.reason);
+  const relationshipId = rel.relationshipId;
+
+  const mbClientId = String(payload?.mbClientId || "").trim();
+  const referrerEmail = String(payload?.referrerEmail || "").trim().toLowerCase();
+  if (!mbClientId) return badRequest("Missing mbClientId");
+  if (!referrerEmail) return badRequest("Missing referrerEmail");
+
+  console.log("sheets linkReferral request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
+    relationshipId,
+    mbClientId,
+    referrerEmail
+  });
+
+  try {
+    // 1. Resolve referrer email -> RSSID. SearchText is fuzzy, so require an
+    //    exact email match, and bail on 0 / many like the phone lookup does.
+    const search = await mindbodyGetClientsBySearch(siteId, referrerEmail);
+    if (!search.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Mindbody getClients failed: ${search.status}`,
+          mindbody: search.data ?? search.text
+        },
+        { status: 502 }
+      );
+    }
+
+    const clients: any[] = search.data?.Clients ?? [];
+    const emailMatches = clients.filter(
+      (c) => String(c?.Email || "").trim().toLowerCase() === referrerEmail
+    );
+
+    if (emailMatches.length === 0) {
+      return NextResponse.json({ ok: true, status: "referrer_not_found", referrerEmail });
+    }
+    if (emailMatches.length > 1) {
+      return NextResponse.json({
+        ok: true,
+        status: "referrer_ambiguous",
+        count: emailMatches.length,
+        candidates: emailMatches.map((c) => String(c.Id))
+      });
+    }
+
+    const referrerClientId = String(emailMatches[0].Id);
+    if (referrerClientId === mbClientId) {
+      return NextResponse.json({ ok: true, status: "self_referral", mbClientId });
+    }
+
+    // 2. One read gives us existing relationships (idempotency) + the name
+    //    fields UpdateClient requires.
+    const info = await mindbodyGetClientCompleteInfo(siteId, mbClientId);
+    if (!info.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Mindbody clientcompleteinfo failed: ${info.status}`,
+          mindbody: info.data ?? info.text
+        },
+        { status: 502 }
+      );
+    }
+
+    const c = info.data?.Client ?? info.data ?? {};
+    const firstName = String(c?.FirstName || "").trim();
+    const lastName = String(c?.LastName || "").trim();
+    if (!firstName || !lastName) {
+      return serverError("Could not read FirstName/LastName for the new client; UpdateClient would fail");
+    }
+
+    const existingRels: any[] = c?.ClientRelationships ?? [];
+    const alreadyLinked = existingRels.some(
+      (r) =>
+        String(r?.RelatedClientId) === referrerClientId &&
+        Number(r?.Relationship?.Id) === Number(relationshipId)
+    );
+    if (alreadyLinked) {
+      return NextResponse.json({ ok: true, status: "already_linked", mbClientId, referrerClientId });
+    }
+
+    // 3. Write the link.
+    const result = await mindbodyAddReferralRelationship(siteId, {
+      mbClientId,
+      firstName,
+      lastName,
+      referrerClientId,
+      relationshipId
+    });
+
+    console.log("mindbody addReferralRelationship result", {
+      status: result.status,
+      ok: result.ok,
+      bodySample: result.text?.slice(0, 300)
+    });
+
+    if (!result.ok) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Mindbody updateClient failed: ${result.status}`,
+          mindbody: result.data ?? result.text
+        },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      status: "linked",
+      mbClientId,
+      referrerClientId,
+      siteId
+    });
+  } catch (err: any) {
+    console.log("sheets linkReferral error", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "Link failed");
   }
 }
 
@@ -972,6 +1200,10 @@ export async function POST(req: Request) {
 
     if (earlyPayload?.updateClient === true) {
       return await handleSheetsUpdateClient(req, earlyPayload);
+    }
+
+    if (earlyPayload?.linkReferral === true) {
+      return await handleSheetsLinkReferral(req, earlyPayload);
     }
 
     // Sheets lead-capture posts from the Apps Script:
