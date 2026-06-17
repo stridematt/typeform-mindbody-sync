@@ -5,6 +5,27 @@ import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
 
+/*
+ * CHANGE LOG (2026-06-16):
+ *   handleSheetsCreate no longer trusts the loose findClient() result. New leads
+ *   were attaching to unrelated existing clients because findClient() returns a
+ *   loose searchText hit (name OR email OR phone) with no verification, unlike
+ *   handleSheetsLookup which verifies phone and bails on ambiguity.
+ *
+ *   The Sheets create path now uses findClientForCreate(), which only treats a
+ *   client as the same person when identity is verified:
+ *     - exact match on a REAL email (single hit), OR
+ *     - verified phone match (single hit) AND the name agrees.
+ *   It never matches on name alone, and never on synthetic fallback email/phone
+ *   (junk like "X", pending+...@strideautomation.com, 1556/555 dummy phones).
+ *   A phone that matches a different-named person (shared household number) now
+ *   creates a new client instead of attaching to that member.
+ *
+ *   NOTE: handleTypeform still calls findClient() directly and has the same
+ *   latent loose-match behavior. It is left unchanged here to avoid altering the
+ *   live Typeform dedup semantics, but it should get the same treatment.
+ */
+
 const sql = neon(
   process.env.DATABASE_URL_V2 || process.env.DATABASE_URL || ""
 );
@@ -187,6 +208,49 @@ function makeDummyPhone(seed: string) {
 function makeDummyEmail(seed: string) {
   const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
   return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
+}
+
+/* ---------- Identity-match guards (added 2026-06-16) ---------- */
+
+/**
+ * True for any value we generated as a placeholder. These must never be used as
+ * a match key, or unrelated leads collide on a shared synthetic identifier.
+ * Covers both the webhook fallback (pending+...@strideautomation.com) and the
+ * Apps Script fallback (pending+tustin-paidleads-rN@strideautomation.com).
+ */
+function isFallbackEmail(email: string) {
+  const e = email.trim().toLowerCase();
+  return e.startsWith("pending+") || e.endsWith(`@${FALLBACK_EMAIL_DOMAIN}`);
+}
+
+/**
+ * True for our synthetic fallback phones: Apps Script "1556" + 7 padded digits,
+ * or webhook makeDummyPhone "555" + 7 digits. Real US numbers do not start 555.
+ */
+function isFallbackPhone(digits: string) {
+  return /^1556\d{7}$/.test(digits) || /^555\d{7}$/.test(digits);
+}
+
+/**
+ * Conservative name agreement for phone-based matches. Both sides must carry a
+ * real first and last name; last names must be equal; first names must be equal
+ * or a clean prefix of one another. Junk like "X" will not agree with a real
+ * surname, which is exactly what we want.
+ */
+function namesAgree(
+  leadFirst: string,
+  leadLast: string,
+  clientFirst: string,
+  clientLast: string
+) {
+  const clean = (s: string) => normalize(s).replace(/[^a-z0-9]/g, "");
+  const lf = clean(leadFirst);
+  const ll = clean(leadLast);
+  const cf = clean(clientFirst);
+  const cl = clean(clientLast);
+  if (!lf || !ll || !cf || !cl) return false;
+  if (ll !== cl) return false;
+  return lf === cf || lf.startsWith(cf) || cf.startsWith(lf);
 }
 
 function unauthorized(reason: string) {
@@ -565,6 +629,85 @@ async function mindbodyAddReferralRelationship(
     method: "POST",
     body: { Client: clientBody, CrossRegionalUpdate: false }
   });
+}
+
+/**
+ * Strict find-for-create (added 2026-06-16). Only treats a Mindbody client as
+ * the same person when identity is verified. This replaces the blind use of
+ * findClient() on the Sheets create path, which matched loosely on name OR email
+ * OR phone and attached new leads to unrelated members.
+ *
+ * Match rules:
+ *   1. Real-email exact match, single hit  -> reuse.
+ *   2. Verified phone match, single hit, AND name agrees -> reuse.
+ * A phone that matches a different-named person (shared household number) is NOT
+ * reused; we let the caller create a new client instead.
+ */
+async function findClientForCreate(
+  siteId: number,
+  args: {
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone: string; // digits only
+    emailIsReal: boolean;
+    phoneIsReal: boolean;
+  }
+): Promise<
+  | { kind: "match"; id: string; via: "email" | "phone" }
+  | { kind: "ambiguous"; via: "email" | "phone"; count: number }
+  | { kind: "none" }
+> {
+  const emailLower = args.email.trim().toLowerCase();
+
+  // 1. Real-email exact match.
+  if (args.emailIsReal && emailLower) {
+    const res = await mindbodyGetClientsBySearch(siteId, emailLower);
+    if (res.ok) {
+      const clients: any[] = res.data?.Clients ?? [];
+      const exact = clients.filter(
+        (c) => String(c?.Email || "").trim().toLowerCase() === emailLower
+      );
+      console.log("findClientForCreate email pass", {
+        emailLower,
+        returned: clients.length,
+        exact: exact.length
+      });
+      if (exact.length === 1) return { kind: "match", id: String(exact[0].Id), via: "email" };
+      if (exact.length > 1) return { kind: "ambiguous", via: "email", count: exact.length };
+    }
+  }
+
+  // 2. Verified phone match, gated on name agreement.
+  if (args.phoneIsReal && args.phone) {
+    const res = await mindbodyGetClientsBySearch(siteId, args.phone.slice(-10));
+    if (res.ok) {
+      const clients: any[] = res.data?.Clients ?? [];
+      const phoneMatches = clients.filter((c) => {
+        const cand = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
+        return cand.some((p: string) => phonesMatch(p, args.phone));
+      });
+      const nameMatches = phoneMatches.filter((c) =>
+        namesAgree(
+          args.firstName,
+          args.lastName,
+          String(c?.FirstName || ""),
+          String(c?.LastName || "")
+        )
+      );
+      console.log("findClientForCreate phone pass", {
+        phoneTail: args.phone.slice(-10),
+        returned: clients.length,
+        phoneMatches: phoneMatches.length,
+        nameMatches: nameMatches.length
+      });
+      if (nameMatches.length === 1) return { kind: "match", id: String(nameMatches[0].Id), via: "phone" };
+      if (nameMatches.length > 1) return { kind: "ambiguous", via: "phone", count: nameMatches.length };
+      // phone matched but no name agreement -> treat as a new person.
+    }
+  }
+
+  return { kind: "none" };
 }
 
 /* ---------- Sheets -> Mindbody: lookup by phone ---------- */
@@ -961,12 +1104,19 @@ async function handleSheetsCreate(req: Request, payload: any) {
 
   const rawEmail = String(lead?.email || "").trim();
   const rawPhone = String(lead?.phone || "").trim();
+  const phoneDigitsRaw = digitsOnly(rawPhone);
 
-  // The Apps Script fills in fallback email/phone per row, but we re-derive
-  // deterministic fallbacks here if either is somehow blank.
+  // Decide which identifiers are REAL and therefore safe to match on. Junk like
+  // "X" (no "@") and our own synthetic fallbacks must never be used as a match
+  // key, or unrelated leads collide on a shared placeholder.
+  const emailIsReal = rawEmail.includes("@") && !isFallbackEmail(rawEmail);
+  const phoneIsReal = phoneDigitsRaw.length >= 10 && !isFallbackPhone(phoneDigitsRaw);
+
+  // For the actual create, substitute deterministic fallbacks for anything not
+  // real, so we never write "X" into Mindbody as an email/phone.
   const seed = `${payload?.sheetId}:${payload?.rowNumber}:${firstName}:${lastName}`;
-  const email = rawEmail || makeDummyEmail(seed);
-  const phone = digitsOnly(rawPhone) || digitsOnly(makeDummyPhone(seed));
+  const email = emailIsReal ? rawEmail : makeDummyEmail(seed);
+  const phone = phoneIsReal ? phoneDigitsRaw : digitsOnly(makeDummyPhone(seed));
 
   console.log("sheets create request", {
     siteKey: payload?.siteKey ?? null,
@@ -977,28 +1127,46 @@ async function handleSheetsCreate(req: Request, payload: any) {
     lastName,
     email,
     phoneDigits: phone,
+    emailIsReal,
+    phoneIsReal,
     leadSource: lead?.leadSource ?? null,
     referralType: lead?.referralType ?? null,
     salesRep: lead?.salesRep ?? null
   });
 
   try {
-    const existing = await findClient(siteId, {
+    const found = await findClientForCreate(siteId, {
       firstName,
       lastName,
       email,
-      phone
+      phone,
+      emailIsReal,
+      phoneIsReal
     });
 
-    if (existing?.Id) {
+    if (found.kind === "ambiguous") {
+      // Don't guess. Surface it so the row gets human review instead of being
+      // silently attached to the wrong person.
+      return NextResponse.json({
+        ok: true,
+        status: "ambiguous",
+        via: found.via,
+        count: found.count,
+        siteId,
+        message: `Multiple Mindbody clients matched on ${found.via}; not auto-linking`
+      });
+    }
+
+    if (found.kind === "match") {
       return NextResponse.json({
         ok: true,
         status: "exists",
-        mbClientId: String(existing.Id),
+        matchedVia: found.via,
+        mbClientId: found.id,
         siteId,
         fallbacksUsed: {
-          emailWasFallback: !rawEmail,
-          phoneWasFallback: !rawPhone
+          emailWasFallback: !emailIsReal,
+          phoneWasFallback: !phoneIsReal
         }
       });
     }
@@ -1018,8 +1186,8 @@ async function handleSheetsCreate(req: Request, payload: any) {
       mbClientId: String(created.Id),
       siteId,
       fallbacksUsed: {
-        emailWasFallback: !rawEmail,
-        phoneWasFallback: !rawPhone
+        emailWasFallback: !emailIsReal,
+        phoneWasFallback: !phoneIsReal
       }
     });
   } catch (err: any) {
@@ -1168,6 +1336,10 @@ async function handleTypeform(req: Request, rawBody: string) {
   });
 
   try {
+    // NOTE (2026-06-16): This path still uses the loose findClient() and shares
+    // the same latent mismatch risk fixed on the Sheets create path. Left as-is
+    // for now to avoid changing live Typeform dedup behavior; migrate it to
+    // findClientForCreate() when ready.
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
