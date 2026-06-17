@@ -24,6 +24,14 @@ export const runtime = "nodejs";
  *   NOTE: handleTypeform still calls findClient() directly and has the same
  *   latent loose-match behavior. It is left unchanged here to avoid altering the
  *   live Typeform dedup semantics, but it should get the same treatment.
+ *
+ * CHANGE LOG (2026-06-16, second pass):
+ *   handleSheetsUpdateClient now protects an already-set Referred By. Before
+ *   writing referredBy, it reads the client's current value; if that value is in
+ *   PROTECTED_REFERRAL_TYPES (Met In Person, Another Client, Social Media Lead),
+ *   the referredBy write is skipped so a later generic touch (Schedule Gate)
+ *   cannot overwrite the original lead source. Adds one clientcompleteinfo read
+ *   per update that carries a referredBy.
  */
 
 const sql = neon(
@@ -38,6 +46,18 @@ const FALLBACK_PHONE_PREFIX = "555";
 const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
 
 const MB_BASE = "https://api.mindbodyonline.com/public/v6";
+
+/*
+ * Referral types that represent a meaningful, original lead source. Once a
+ * client's Mindbody "Referred By" is already set to one of these, a later
+ * generic touch (e.g. Schedule Gate) must NOT overwrite it. Compared lowercase.
+ * Add more values here if other sources should be protected the same way.
+ */
+const PROTECTED_REFERRAL_TYPES = new Set([
+  "met in person",
+  "another client",
+  "social media lead"
+]);
 
 /* ---------- Crypto / auth helpers ---------- */
 
@@ -830,6 +850,52 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
     return badRequest("Nothing to update (referredBy and salesRep both empty)");
   }
 
+  // PROTECTION (2026-06-16): never overwrite an already-set, meaningful Referred
+  // By. A later generic touch (e.g. Schedule Gate) must not clobber the original
+  // lead source. Read the client's current ReferredBy first; if it is already a
+  // protected type, drop referredBy from this update and keep what is there.
+  let referredByToSend: string | undefined = referredBy || undefined;
+  let keptReferredBy: string | null = null;
+
+  if (referredByToSend) {
+    const info = await mindbodyGetClientCompleteInfo(siteId, mbClientId);
+    if (info.ok) {
+      const c = info.data?.Client ?? info.data ?? {};
+      const current = String(c?.ReferredBy ?? "").trim();
+      if (current && PROTECTED_REFERRAL_TYPES.has(current.toLowerCase())) {
+        referredByToSend = undefined; // leave the existing value in place
+        keptReferredBy = current;
+      }
+    } else {
+      // Could not read the current value. Fail safe toward NOT overwriting,
+      // since clobbering a protected source is the costly mistake. salesRep (if
+      // any) still goes through below. Flip this if you'd rather write on read
+      // failure.
+      console.log("updateClient protection read failed; skipping referredBy", {
+        mbClientId,
+        status: info.status
+      });
+      referredByToSend = undefined;
+      keptReferredBy = "unknown (read failed)";
+    }
+  }
+
+  // After protection, if there's nothing left to write, report and stop.
+  if (!referredByToSend && !salesRepRaw) {
+    console.log("sheets updateClient skipped (protected ReferredBy)", {
+      mbClientId,
+      siteId,
+      keptReferredBy
+    });
+    return NextResponse.json({
+      ok: true,
+      status: "skipped_protected",
+      mbClientId,
+      siteId,
+      keptReferredBy
+    });
+  }
+
   console.log("sheets updateClient request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -837,7 +903,8 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
     mbClientId,
     hasFirstName: !!firstName,
     hasLastName: !!lastName,
-    referredBy: referredBy || null,
+    referredBy: referredByToSend || null,
+    keptReferredBy,
     salesRep: salesRepRaw || null
   });
 
@@ -846,7 +913,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       mbClientId,
       firstName,
       lastName,
-      referredBy: referredBy || undefined,
+      referredBy: referredByToSend,
       salesRep: salesRepRaw || undefined
     });
 
@@ -872,6 +939,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       status: "updated",
       mbClientId,
       siteId,
+      keptReferredBy,
       mindbody: result.data
     });
   } catch (err: any) {
