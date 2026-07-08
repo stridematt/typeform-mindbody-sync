@@ -28,6 +28,21 @@ const MINDBODY_BASE_URL = "https://api.mindbodyonline.com/public/v6";
    skipped (see handler). If NONE of these env vars are set, the
    allowlist check is disabled so the route still works.
 ============================================================ */
+/**
+ * Numeric ID of the "Notes" contact-log TYPE (the checkbox in Mindbody).
+ * The API can't look types up by name, so the ID is configured via env.
+ * Type IDs can differ per site, so a per-site override is checked first:
+ *   MINDBODY_NOTES_TYPE_ID_<siteId>   e.g. MINDBODY_NOTES_TYPE_ID_5749887
+ * falling back to a shared MINDBODY_NOTES_TYPE_ID. Returns null if unset,
+ * in which case the log is still written but no type box is ticked.
+ */
+function notesTypeId(siteId: number): number | null {
+  const raw =
+    process.env[`MINDBODY_NOTES_TYPE_ID_${siteId}`] ?? process.env.MINDBODY_NOTES_TYPE_ID;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function allowedSiteIds(): Set<number> {
   return new Set(
     [
@@ -199,15 +214,28 @@ function extractLead(payload: any) {
 }
 
 /* ============================================================
-   Clean contact-log body (plain text — always renders in MB)
+   Clean contact-log body (HTML — Mindbody renders it)
+   Bold header, then each question as its own block: bold label
+   on one line, the answer beneath, with spacing between blocks.
+   Visitor-supplied answers are escaped so they can't break markup.
 ============================================================ */
+function esc(s?: string | null): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function buildLogText(lead: ReturnType<typeof extractLead>): string {
-  const lines: string[] = ["Cancellation Survey Response"];
-  lines.push(`Reason for cancelling: ${lead.reason || "(not provided)"}`);
-  lines.push(
-    `What we could have done better: ${lead.improvement || "(not provided)"}`
-  );
-  return lines.join("\n\n").slice(0, 3800);
+  const block = (label: string, value: string | null) =>
+    `<p><strong>${label}</strong><br>${esc(value || "(not provided)")}</p>`;
+
+  const html =
+    `<p><strong>Cancellation Survey Response</strong></p>` +
+    block("Reason for cancelling:", lead.reason) +
+    block("What we could have done better:", lead.improvement);
+
+  return html.slice(0, 3800);
 }
 
 /* ============================================================
@@ -228,7 +256,13 @@ async function clientExists(siteId: number, clientId: string): Promise<boolean> 
 
 async function addContactLog(
   siteId: number,
-  input: { clientId: string; text: string; contactName?: string; contactMethod?: string }
+  input: {
+    clientId: string;
+    text: string;
+    contactName?: string;
+    contactMethod?: string;
+    typeIds?: number[];
+  }
 ) {
   const apiKey = process.env.MINDBODY_API_KEY as string;
   const token = await getToken(siteId);
@@ -237,11 +271,17 @@ async function addContactLog(
     ClientId: String(input.clientId),
     Text: input.text,
     // ContactMethod is REQUIRED by addcontactlog. Always send it.
-    ContactMethod: input.contactMethod || "Phone",
+    ContactMethod: input.contactMethod || "Note",
     // NO FollowupByDate and NO AssignedToStaffId -> plain contact-log entry
     // (Mindbody requires those two to be both present or both absent).
   };
   if (input.contactName) payload.ContactName = input.contactName;
+  // Ticks the matching type checkbox(es) in Mindbody (e.g. "Notes").
+  // The API only accepts numeric type IDs, so these come from env (see
+  // notesTypeId). Omitted entirely when no ID is configured.
+  if (input.typeIds && input.typeIds.length) {
+    payload.Types = input.typeIds.map((id) => ({ Id: id }));
+  }
 
   const res = await fetch(`${MINDBODY_BASE_URL}/client/addcontactlog`, {
     method: "POST",
@@ -329,11 +369,13 @@ export async function POST(req: Request) {
       });
     }
 
+    const typeId = notesTypeId(lead.siteId);
     const mb = await addContactLog(lead.siteId, {
       clientId: lead.clientId,
       text: buildLogText(lead),
       contactName: [lead.firstName, lead.lastName].filter(Boolean).join(" ") || undefined,
-      contactMethod: "Phone",
+      contactMethod: "Note",
+      typeIds: typeId ? [typeId] : undefined,
     });
 
     return NextResponse.json({
