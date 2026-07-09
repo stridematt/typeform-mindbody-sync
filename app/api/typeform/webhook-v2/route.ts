@@ -22,11 +22,13 @@ const LEAD_CHANNEL_BY_ATTRIBUTION: Record<string, string> = {
   affiliate: "Referral",
   coach: "Referral",
 };
-// Pipeline stage that new webhook leads are forced into after creation, so they
+// Prospect stage that new webhook leads are forced into after creation, so they
 // enter the Sales Pipeline regardless of how the Lead Channel routes them.
-// MUST match a stage name in your Mindbody Sales Pipeline. Mindbody's docs
-// confirm "New Lead" works; change this if your intake stage is named
-// differently.
+// Setting the stage by ID is what actually sticks (Description alone was
+// ignored). Id 1 = "New Lead" for site 5749750 (confirmed via client lookup).
+// NOTE: if other studios sit on a different pipeline, their "New Lead" stage
+// may have a different Id — revisit this when you add more sites.
+const PIPELINE_STAGE_ID_FOR_NEW_LEADS = 1;
 const PIPELINE_STAGE_FOR_NEW_LEADS = "New Lead";
 // Cache resolved channel IDs per site+name to avoid repeat lookups.
 const leadChannelIdCache = new Map<string, number | null>();
@@ -543,6 +545,7 @@ export async function POST(req: Request) {
       let pipelineStage: string | null = null;
       try {
         await updateClient(siteId, created.Id, {
+          prospectStageId: PIPELINE_STAGE_ID_FOR_NEW_LEADS,
           prospectStageDescription: PIPELINE_STAGE_FOR_NEW_LEADS
         });
         pipelineStage = PIPELINE_STAGE_FOR_NEW_LEADS;
