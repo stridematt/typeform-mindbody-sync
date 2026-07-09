@@ -3,9 +3,7 @@ import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
 import { createClient } from "../../../../lib/mindbody";
 export const runtime = "nodejs";
-const sql = neon(
-  process.env.DATABASE_URL_V2 || process.env.DATABASE_URL || ""
-);
+const sql = neon(process.env.DATABASE_URL || "");
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
 function timingSafeEqual(a: string, b: string) {
@@ -185,8 +183,8 @@ function extractLead(payload: any) {
   };
 }
 async function ensureTables() {
-  if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
+  if (!process.env.DATABASE_URL) {
+    throw new Error("Missing DATABASE_URL.");
   }
   await sql`
     create table if not exists studio_site_mappings (
