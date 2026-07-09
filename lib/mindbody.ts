@@ -154,7 +154,11 @@ export async function createClient(
 export async function updateClient(
   siteId: number,
   mbClientId: string | number,
-  updates: { salesRep?: number; prospectStageDescription?: string }
+  updates: {
+    salesRep?: number;
+    prospectStageId?: number;
+    prospectStageDescription?: string;
+  }
 ) {
   const client = await mbClient(siteId);
   const clientPayload: Record<string, any> = {
@@ -172,17 +176,27 @@ export async function updateClient(
       },
     ];
   }
-  if (
+  const hasStageId =
+    updates.prospectStageId !== undefined &&
+    updates.prospectStageId !== null &&
+    Number.isFinite(updates.prospectStageId);
+  const hasStageDescription =
     typeof updates.prospectStageDescription === "string" &&
-    updates.prospectStageDescription.trim()
-  ) {
-    // Per docs: setting IsProspect=true alongside ProspectStage.Description
-    // is what triggers the Sales Pipeline opportunity create/move on
-    // Ultimate-tier accounts.
+    updates.prospectStageDescription.trim().length > 0;
+  if (hasStageId || hasStageDescription) {
+    // Per docs: setting IsProspect=true alongside ProspectStage is what triggers
+    // the Sales Pipeline opportunity create/move on Ultimate-tier accounts.
+    // Sending the stage Id is the most reliable; Description is included as a
+    // fallback/label. Get valid Ids from listProspectStages().
     clientPayload.IsProspect = true;
-    clientPayload.ProspectStage = {
-      Description: updates.prospectStageDescription.trim(),
-    };
+    clientPayload.ProspectStage = {};
+    if (hasStageId) {
+      clientPayload.ProspectStage.Id = Number(updates.prospectStageId);
+    }
+    if (hasStageDescription) {
+      clientPayload.ProspectStage.Description =
+        updates.prospectStageDescription!.trim();
+    }
   }
   const res = await client.post(`/client/updateclient`, {
     Client: clientPayload,
@@ -267,4 +281,16 @@ export async function listLeadChannels(siteId: number) {
   // Mindbody returns { Sites: [{ ..., LeadChannels: [...] }] }
   const sites = res.data?.Sites ?? [];
   return sites[0]?.LeadChannels ?? [];
+}
+/**
+ * List the Sales Pipeline prospect stages for a site.
+ *
+ * Hits GET /client/prospectstages. Each stage has { Id, Description, Active }.
+ * Use the Id with updateClient({ prospectStageId }) to move a lead into a stage.
+ */
+export async function listProspectStages(siteId: number) {
+  const client = await mbClient(siteId);
+  const res = await client.get(`/client/prospectstages`);
+  // Mindbody returns { ProspectStages: [...] }
+  return res.data?.ProspectStages ?? [];
 }
