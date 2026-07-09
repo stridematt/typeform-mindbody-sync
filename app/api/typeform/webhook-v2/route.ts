@@ -1,11 +1,48 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import { createClient } from "../../../../lib/mindbody";
+import { createClient, listLeadChannels } from "../../../../lib/mindbody";
 export const runtime = "nodejs";
 const sql = neon(process.env.DATABASE_URL || "");
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
+// Maps our attribution type to the exact Mindbody Referral Type names so
+// Analytics 2.0 groups these leads under a clean "Affiliate"/"Coach" Lead
+// Source. Values MUST match the Referral Types configured in Mindbody
+// (Manager Tools > Referral Types) or Mindbody falls back to "Other".
+const REFERRAL_TYPE_BY_ATTRIBUTION: Record<string, string> = {
+  affiliate: "Affiliate",
+  coach: "Coach",
+};
+// Maps our attribution type to the Mindbody Lead Channel NAME (Sales Pipeline >
+// Lead Channels). The channel must exist in Mindbody for the site or we leave
+// the lead on the default "Public API" channel. Matched by name at runtime so
+// it works across sites/pipelines without hardcoding numeric channel IDs.
+const LEAD_CHANNEL_BY_ATTRIBUTION: Record<string, string> = {
+  affiliate: "Referral",
+  coach: "Referral",
+};
+// Cache resolved channel IDs per site+name to avoid repeat lookups.
+const leadChannelIdCache = new Map<string, number | null>();
+async function resolveLeadChannelId(siteId: number, channelName: string) {
+  const cacheKey = `${siteId}:${channelName.toLowerCase()}`;
+  if (leadChannelIdCache.has(cacheKey)) {
+    return leadChannelIdCache.get(cacheKey) ?? null;
+  }
+  try {
+    const channels = (await listLeadChannels(siteId)) as any[];
+    const match = channels.find(
+      (c) => String(c?.Name ?? "").toLowerCase() === channelName.toLowerCase()
+    );
+    const id =
+      match?.Id !== undefined && match?.Id !== null ? Number(match.Id) : null;
+    leadChannelIdCache.set(cacheKey, id);
+    return id;
+  } catch (err) {
+    console.log("resolveLeadChannelId failed:", err);
+    return null;
+  }
+}
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
@@ -456,6 +493,27 @@ export async function POST(req: Request) {
           }
         });
       }
+      // Send the referral TYPE (e.g. "Affiliate"/"Coach") as ReferredBy so it
+      // maps to a real Mindbody Referral Type and Analytics 2.0 reports a clean
+      // Lead Source instead of "Public API". If the type is unknown, fall back
+      // to the raw attribution name (lands under "Other"). The specific
+      // referrer name is always retained in processed_submissions_v2.attribution.
+      const referredBy =
+        (lead.attributionType &&
+          REFERRAL_TYPE_BY_ATTRIBUTION[lead.attributionType]) ||
+        lead.attribution ||
+        undefined;
+      // Resolve the Lead Channel (e.g. "Affiliate"/"Coach") to its Mindbody Id
+      // so Analytics 2.0 reports the real Lead Channel instead of "Public API".
+      // Falls back to no channel (Public API) if the channel isn't configured.
+      const channelName =
+        (lead.attributionType &&
+          LEAD_CHANNEL_BY_ATTRIBUTION[lead.attributionType]) ||
+        null;
+      const leadChannelId = channelName
+        ? await resolveLeadChannelId(siteId, channelName)
+        : null;
+      console.log("resolved lead channel:", { channelName, leadChannelId });
       const created = await createClient(
         siteId,
         {
@@ -465,9 +523,8 @@ export async function POST(req: Request) {
           phone: normalizedPhone
         },
         {
-          // Sets Mindbody's "Referred By" field so Analytics 2.0 reports the
-          // real lead source (the affiliate/coach) instead of "Public API".
-          referredBy: lead.attribution
+          referredBy,
+          leadChannelId: leadChannelId ?? undefined
         }
       );
       console.log("created MB client result:", created);
