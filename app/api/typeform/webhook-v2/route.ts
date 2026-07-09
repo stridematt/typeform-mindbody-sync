@@ -19,8 +19,8 @@ const REFERRAL_TYPE_BY_ATTRIBUTION: Record<string, string> = {
 // the lead on the default "Public API" channel. Matched by name at runtime so
 // it works across sites/pipelines without hardcoding numeric channel IDs.
 const LEAD_CHANNEL_BY_ATTRIBUTION: Record<string, string> = {
-  affiliate: "Referral",
-  coach: "Referral",
+  affiliate: "Grassroots",
+  coach: "Grassroots",
 };
 // Prospect stage that new webhook leads are forced into after creation, so they
 // enter the Sales Pipeline regardless of how the Lead Channel routes them.
