@@ -1,35 +1,28 @@
 // lib/mindbody.ts
 import axios from "axios";
-
 const BASE_URL = "https://api.mindbodyonline.com/public/v6";
-
 function requireEnv(name: string) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ${name}`);
   return v;
 }
-
 function assertValidSiteId(siteId: number) {
   if (!Number.isInteger(siteId) || siteId <= 0) {
     throw new Error(`Invalid siteId: ${siteId}`);
   }
   return siteId;
 }
-
 const tokenCache = new Map<number, { token: string; issuedAt: number }>();
 const TOKEN_TTL_MS = 10 * 60 * 1000;
-
 async function getToken(siteId: number) {
   assertValidSiteId(siteId);
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const username = requireEnv("MINDBODY_USERNAME");
   const password = requireEnv("MINDBODY_PASSWORD");
-
   const cached = tokenCache.get(siteId);
   if (cached && Date.now() - cached.issuedAt < TOKEN_TTL_MS) {
     return cached.token;
   }
-
   const res = await axios.post(
     `${BASE_URL}/usertoken/issue`,
     { Username: username, Password: password },
@@ -42,21 +35,17 @@ async function getToken(siteId: number) {
       timeout: 20000,
     }
   );
-
   const accessToken = res.data?.AccessToken as string | undefined;
   if (!accessToken) {
     throw new Error("Mindbody token response missing AccessToken");
   }
-
   tokenCache.set(siteId, { token: accessToken, issuedAt: Date.now() });
   return accessToken;
 }
-
 async function mbClient(siteId: number) {
   assertValidSiteId(siteId);
   const apiKey = requireEnv("MINDBODY_API_KEY");
   const token = await getToken(siteId);
-
   return axios.create({
     baseURL: BASE_URL,
     timeout: 25000,
@@ -68,19 +57,16 @@ async function mbClient(siteId: number) {
     },
   });
 }
-
 export async function findClient(
   siteId: number,
   input: { firstName?: string; lastName?: string; email?: string; phone?: string }
 ) {
   const client = await mbClient(siteId);
-
   const candidates: string[] = [];
   if (input.email) candidates.push(input.email);
   if (input.phone) candidates.push(input.phone);
   const fullName = `${input.firstName ?? ""} ${input.lastName ?? ""}`.trim();
   if (fullName) candidates.push(fullName);
-
   for (const q of candidates) {
     const res = await client.get(`/client/clients`, { params: { SearchText: q } });
     const found = res.data?.Clients?.[0];
@@ -88,26 +74,37 @@ export async function findClient(
   }
   return null;
 }
-
 /**
  * Create a prospect client in Mindbody.
  * Optional:
- *   - referralType: sets the Mindbody Referral Type dropdown (e.g. "Paid Lead")
+ *   - referredBy: sets the Mindbody "Referred By" field on the client. This is
+ *     the value Analytics 2.0 reports as the Lead Source. If you do NOT send a
+ *     value, Mindbody stamps API-created clients with the source "Public API".
+ *     Pass the real source here (e.g. the affiliate/coach name from Typeform)
+ *     so the lead is attributed correctly.
+ *   - referralType: legacy alias for referredBy, kept for the Google Sheets
+ *     flow (e.g. "Paid Lead"). If both are provided, referredBy wins.
  *   - salesRep: numeric staff Id assigned to Rep 1 on the client profile
  *   - leadChannelId: numeric Lead Management channel Id. Tags the lead with
  *     this channel. If the tenant has automated channel-to-stage mapping
  *     configured, this can also route the lead to a specific pipeline stage.
  *
- * IMPORTANT: Only pass referralType from your Google Sheets flow.
- * Do NOT pass it from your Typeform flow.
+ * NOTE: Mindbody's "Referred By" generally sticks best when the value matches a
+ * Referral Type configured on the site (Manager Tools > Referral Types). If you
+ * send a value that doesn't exist as a referral type, some sites may drop it.
+ * Make sure your affiliate/coach names exist as referral types on each site.
  */
 export async function createClient(
   siteId: number,
   input: { firstName: string; lastName: string; email?: string; phone?: string },
-  options?: { referralType?: string; salesRep?: number; leadChannelId?: number }
+  options?: {
+    referredBy?: string;
+    referralType?: string;
+    salesRep?: number;
+    leadChannelId?: number;
+  }
 ) {
   const client = await mbClient(siteId);
-
   const payload: Record<string, any> = {
     FirstName: input.firstName,
     LastName: input.lastName,
@@ -115,11 +112,11 @@ export async function createClient(
     MobilePhone: input.phone ?? "",
     IsProspect: true,
   };
-
-  if (options?.referralType) {
-    payload.ReferredBy = options.referralType;
+  // referredBy is the canonical option; referralType is kept as a legacy alias.
+  const referredByValue = options?.referredBy ?? options?.referralType;
+  if (referredByValue && referredByValue.trim()) {
+    payload.ReferredBy = referredByValue.trim();
   }
-
   if (
     options?.salesRep !== undefined &&
     options?.salesRep !== null &&
@@ -132,7 +129,6 @@ export async function createClient(
       },
     ];
   }
-
   if (
     options?.leadChannelId !== undefined &&
     options?.leadChannelId !== null &&
@@ -140,11 +136,9 @@ export async function createClient(
   ) {
     payload.LeadChannelId = Number(options.leadChannelId);
   }
-
   const res = await client.post(`/client/addclient`, payload);
   return res.data?.Client ?? null;
 }
-
 /**
  * Update an existing client.
  *
@@ -163,11 +157,9 @@ export async function updateClient(
   updates: { salesRep?: number; prospectStageDescription?: string }
 ) {
   const client = await mbClient(siteId);
-
   const clientPayload: Record<string, any> = {
     Id: String(mbClientId),
   };
-
   if (
     updates.salesRep !== undefined &&
     updates.salesRep !== null &&
@@ -180,7 +172,6 @@ export async function updateClient(
       },
     ];
   }
-
   if (
     typeof updates.prospectStageDescription === "string" &&
     updates.prospectStageDescription.trim()
@@ -193,14 +184,12 @@ export async function updateClient(
       Description: updates.prospectStageDescription.trim(),
     };
   }
-
   const res = await client.post(`/client/updateclient`, {
     Client: clientPayload,
     CrossRegionalUpdate: false,
   });
   return res.data?.Client ?? null;
 }
-
 /**
  * Add a Contact Log (= "Sales Followup Task" in the Sales Pipeline UI).
  *
@@ -232,7 +221,6 @@ export async function addContactLog(
   }
 ) {
   const client = await mbClient(siteId);
-
   // Default follow-up date: 24 hours from now.
   // The trigger fires on "task created immediately after lead creation",
   // not on the follow-up date, so the exact value doesn't matter much —
@@ -240,14 +228,12 @@ export async function addContactLog(
   // an open task.
   const followupByDate =
     input.followupByDate ?? new Date(Date.now() + 24 * 60 * 60 * 1000);
-
   const payload: Record<string, any> = {
     ClientId: String(input.clientId),
     Text: input.text ?? "Auto-created follow-up task from Paid Leads pipeline",
     FollowupByDate: followupByDate.toISOString(),
     IsComplete: false,
   };
-
   if (
     input.assignedToStaffId !== undefined &&
     input.assignedToStaffId !== null &&
@@ -255,18 +241,15 @@ export async function addContactLog(
   ) {
     payload.AssignedToStaffId = Number(input.assignedToStaffId);
   }
-
   if (input.contactMethod) {
     payload.ContactMethod = input.contactMethod;
   }
   if (input.contactName) {
     payload.ContactName = input.contactName;
   }
-
   const res = await client.post(`/client/addcontactlog`, payload);
   return res.data ?? null;
 }
-
 /**
  * List Lead Channels configured for the site.
  *
