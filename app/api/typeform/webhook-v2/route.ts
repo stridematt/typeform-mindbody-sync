@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
-import { createClient, listLeadChannels } from "../../../../lib/mindbody";
+import { createClient, listLeadChannels, updateClient } from "../../../../lib/mindbody";
 export const runtime = "nodejs";
 const sql = neon(process.env.DATABASE_URL || "");
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
@@ -22,6 +22,12 @@ const LEAD_CHANNEL_BY_ATTRIBUTION: Record<string, string> = {
   affiliate: "Referral",
   coach: "Referral",
 };
+// Pipeline stage that new webhook leads are forced into after creation, so they
+// enter the Sales Pipeline regardless of how the Lead Channel routes them.
+// MUST match a stage name in your Mindbody Sales Pipeline. Mindbody's docs
+// confirm "New Lead" works; change this if your intake stage is named
+// differently.
+const PIPELINE_STAGE_FOR_NEW_LEADS = "New Lead";
 // Cache resolved channel IDs per site+name to avoid repeat lookups.
 const leadChannelIdCache = new Map<string, number | null>();
 async function resolveLeadChannelId(siteId: number, channelName: string) {
@@ -531,6 +537,19 @@ export async function POST(req: Request) {
       if (!created?.Id) {
         return NextResponse.json({ ok: false, error: "Mindbody create failed" }, { status: 500 });
       }
+      // Force the new lead into the intake pipeline stage so it lands in the
+      // Sales Pipeline regardless of Lead Channel routing. Non-fatal: if this
+      // fails, the client still exists and we still return success.
+      let pipelineStage: string | null = null;
+      try {
+        await updateClient(siteId, created.Id, {
+          prospectStageDescription: PIPELINE_STAGE_FOR_NEW_LEADS
+        });
+        pipelineStage = PIPELINE_STAGE_FOR_NEW_LEADS;
+        console.log("moved lead to pipeline stage:", PIPELINE_STAGE_FOR_NEW_LEADS);
+      } catch (stageErr) {
+        console.log("failed to set pipeline stage:", stageErr);
+      }
       return NextResponse.json({
         ok: true,
         status: "created",
@@ -538,6 +557,8 @@ export async function POST(req: Request) {
         routedTo: { studioName: mapping.studio_name, siteId },
         attribution: lead.attribution,
         attributionType: lead.attributionType,
+        leadChannelId,
+        pipelineStage,
         fallbacksUsed: {
           emailWasFallback: !lead.email,
           phoneWasFallback: !lead.phone
