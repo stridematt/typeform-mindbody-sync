@@ -327,7 +327,7 @@ async function mindbodySearchClients(
     const res = await fetch(url.toString(), {
       headers: {
         "Api-Key": apiKey,
-        Authorization: token, // [FIX A] bare token, no "Bearer"
+        Authorization: `Bearer ${token}`, // Bearer confirmed against live coach-log flow
         SiteId: String(siteId),
       },
     });
