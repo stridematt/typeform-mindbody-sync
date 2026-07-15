@@ -2,9 +2,7 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
 import { findClient, createClient } from "../../../../lib/mindbody";
-
 export const runtime = "nodejs";
-
 /*
  * CHANGE LOG (2026-06-16):
  *   handleSheetsCreate no longer trusts the loose findClient() result. New leads
@@ -21,78 +19,45 @@ export const runtime = "nodejs";
  *   A phone that matches a different-named person (shared household number) now
  *   creates a new client instead of attaching to that member.
  *
+ *   NOTE: handleTypeform still calls findClient() directly and has the same
+ *   latent loose-match behavior. It is left unchanged here to avoid altering the
+ *   live Typeform dedup semantics, but it should get the same treatment.
+ *
  * CHANGE LOG (2026-06-16, second pass):
- *   handleSheetsUpdateClient now protects an already-set Referred By. (unchanged)
- *
- * CHANGE LOG (2026-07-15): PHONE-MATCH / DUPLICATE-CREATION AUDIT
- *   Root cause of the duplicate-client reports was that findClientForCreate had
- *   become *too* strict / too narrow after the 2026-06-16 pass, so it failed to
- *   find real existing clients and then created a second copy. Fixes:
- *
- *   [FIX 1] findClientForCreate now searches the SAME set of phone candidates as
- *           handleSheetsLookup (tail-10, full-digits, and the raw formatted
- *           value), aggregating hits across candidates before filtering. Before,
- *           it searched only the 10-digit tail, so any client whose stored phone
- *           was indexed with a country code / formatting was missed.
- *
- *   [FIX 2] namesAgree now canonicalises common nicknames (Mike->Michael, etc.)
- *           and accepts a first-initial match, so a verified phone hit for the
- *           same person is no longer discarded (and duplicated) just because the
- *           first name is a nickname. Last-name equality is still required, which
- *           preserves the shared-household protection.
- *
- *   [FIX 3] mindbodyGetClientsBySearch now paginates (up to MB_SEARCH_MAX_RECORDS)
- *           instead of only seeing the first 20 rows. A phone searchText matches
- *           loosely on name/email/phone, so at a busy studio the true record
- *           could sit past row 20 and never reach the phone filter.
- *
- *   [FIX 4] handleSheetsCreate is now idempotent. It reserves a per-row lock in
- *           processed_sheet_rows_v1 (unique on site_id + sheet_id + row_number)
- *           BEFORE creating, and also dedupes on a real identity key
- *           (email/phone). This closes the retry / double-fire / Mindbody
- *           search-index-lag race that produced most duplicates even when the
- *           matching logic was correct.
- *
- *   NOTE: handleTypeform still calls the loose findClient(). Loose matching over-
- *   merges rather than duplicates, so it is not a source of the duplicate reports;
- *   migrating it to findClientForCreate() is tracked separately.
+ *   handleSheetsUpdateClient now protects an already-set Referred By. Before
+ *   writing referredBy, it reads the client's current value; if that value is in
+ *   PROTECTED_REFERRAL_TYPES (Met In Person, Another Client, Social Media Lead),
+ *   the referredBy write is skipped so a later generic touch (Schedule Gate)
+ *   cannot overwrite the original lead source. Adds one clientcompleteinfo read
+ *   per update that carries a referredBy.
  */
-
 const sql = neon(
   process.env.DATABASE_URL_V2 || process.env.DATABASE_URL || ""
 );
-
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
-
 // Default site for Sheets-originated flows when siteKey is missing.
 // Kept for backward-compat with the original HB-only sheet.
 const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
-
 const MB_BASE = "https://api.mindbodyonline.com/public/v6";
-
-// [FIX 3] Cap total records we page through per search. Mindbody's searchText is
-// loose (matches name/email/phone), so the true phone/email match can be past
-// the first page. 200 is plenty for a single first/last/phone/email lookup while
-// bounding worst-case latency.
-const MB_SEARCH_PAGE_SIZE = 100;
-const MB_SEARCH_MAX_RECORDS = 200;
-
+/*
+ * Referral types that represent a meaningful, original lead source. Once a
+ * client's Mindbody "Referred By" is already set to one of these, a later
+ * generic touch (e.g. Schedule Gate) must NOT overwrite it. Compared lowercase.
+ * Add more values here if other sources should be protected the same way.
+ */
 const PROTECTED_REFERRAL_TYPES = new Set([
   "met in person",
   "another client",
   "social media lead"
 ]);
-
 /* ---------- Crypto / auth helpers ---------- */
-
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
-
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
@@ -113,7 +78,6 @@ async function verifyTypeform(req: Request, rawBody: string) {
   if (headerSecret && headerSecret === secret) return { ok: true };
   return { ok: false };
 }
-
 function verifySheetsSecret(req: Request) {
   const secret = process.env.SHEETS_WEBHOOK_SECRET;
   if (!secret) return { ok: false, reason: "Missing SHEETS_WEBHOOK_SECRET on server" };
@@ -124,17 +88,24 @@ function verifySheetsSecret(req: Request) {
   if (!timingSafeEqual(provided, secret)) return { ok: false, reason: "Bad secret" };
   return { ok: true };
 }
-
 /* ---------- Multi-studio site resolution ---------- */
-
+/**
+ * Resolve a payload siteKey (e.g. "TUSTIN") to a Mindbody Site ID, by looking
+ * up the env var MINDBODY_SITE_ID_{KEY}. Falls back to HB when siteKey is
+ * blank, so existing HB-only sheets keep working without modification.
+ *
+ * Returns { ok: true, siteId } on success or { ok: false, reason } on failure.
+ */
 function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: false; reason: string } {
   const rawKey = String(siteKey || "").trim();
+  // No siteKey provided -> default to HB for backward compatibility.
   if (!rawKey) {
     if (!HB_SITE_ID) {
       return { ok: false, reason: "Missing MINDBODY_SITE_ID_HB on server (no siteKey provided)" };
     }
     return { ok: true, siteId: HB_SITE_ID };
   }
+  // siteKey must be alphanumeric/underscore only to safely build the env name.
   if (!/^[A-Za-z0-9_]+$/.test(rawKey)) {
     return { ok: false, reason: `Invalid siteKey: ${rawKey}` };
   }
@@ -146,11 +117,21 @@ function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: f
   }
   return { ok: true, siteId: parsed };
 }
-
+/**
+ * Resolve a payload siteKey to the Mindbody "Referred By" relationship type ID,
+ * via MINDBODY_REFBY_RELATIONSHIP_ID_{KEY}. Mirrors resolveSiteId, including the
+ * blank-siteKey -> HB fallback.
+ *
+ * Mindbody has no endpoint that lists relationship types, so you discover the ID
+ * once per site (add the relationship in the UI, then read it back via
+ * clientcompleteinfo) and store it in these env vars.
+ */
 function resolveReferralRelationshipId(
   siteKey: unknown
 ): { ok: true; relationshipId: number } | { ok: false; reason: string } {
   const rawKey = String(siteKey || "").trim();
+  // Mindbody system relationships use negative IDs (e.g. "Referred By" is -1),
+  // so accept any non-zero integer. Only an empty/unset env or 0 is invalid.
   const readEnv = (envName: string): { ok: true; id: number } | { ok: false } => {
     const raw = process.env[envName];
     if (raw === undefined || raw === null || String(raw).trim() === "") return { ok: false };
@@ -175,9 +156,7 @@ function resolveReferralRelationshipId(
   }
   return { ok: true, relationshipId: rel.id };
 }
-
 /* ---------- Generic helpers ---------- */
-
 function normalize(s: string) {
   return s
     .toLowerCase()
@@ -185,142 +164,54 @@ function normalize(s: string) {
     .replace(/\s+/g, " ")
     .replace(/&/g, "and");
 }
-
 function slugifyStudioName(s: string) {
   return normalize(s).replace(/[^a-z0-9]+/g, "");
 }
-
 function digitsOnly(s: string) {
   return (s || "").replace(/\D/g, "");
 }
-
-/*
- * Canonical 10-digit phone key, or "" if we cannot derive one. Single source of
- * truth for "are these the same phone" and for building identity keys.
- *
- * RULE (per product requirement): match on the LAST 10 digits. Taking the last
- * 10 digits inherently ignores any leading country code ("+1", "1", or other
- * prefixes) — so +15084467211, 1-508-446-7211, and (508) 446-7211 all reduce to
- * "5084467211" and resolve to the same profile.
- *
- * Examples: "+15084467211" -> "5084467211", "(508) 446-7211" -> "5084467211",
- *           "1 508 446 7211" -> "5084467211".
- *
- * CAVEAT: a value that carries a trailing extension ("508-446-7211 x4") would
- * put the extension in the last-10 window. Extensions are not expected in the
- * lead phone field; if they appear, strip them before this call.
- */
-function canonicalPhone(s: string) {
-  const d = digitsOnly(s);
-  if (d.length < 10) return "";
-  return d.slice(-10);
-}
-
 function phonesMatch(a: string, b: string) {
-  const ca = canonicalPhone(a);
-  const cb = canonicalPhone(b);
-  if (!ca || !cb) return false;
-  return ca === cb;
+  const da = digitsOnly(a);
+  const db = digitsOnly(b);
+  if (!da || !db) return false;
+  // Compare last 10 digits to ignore +1 / country-code differences.
+  const tailA = da.slice(-10);
+  const tailB = db.slice(-10);
+  return tailA.length === 10 && tailA === tailB;
 }
-
 function makeDummyPhone(seed: string) {
   const hex = crypto.createHash("sha256").update(seed).digest("hex");
   const digits = hex.replace(/\D/g, "").padEnd(20, "0");
   const last7 = digits.slice(-7);
   return `${FALLBACK_PHONE_PREFIX}${last7}`;
 }
-
 function makeDummyEmail(seed: string) {
   const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
   return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
 }
-
-/* ---------- Identity-match guards ---------- */
-
+/* ---------- Identity-match guards (added 2026-06-16) ---------- */
+/**
+ * True for any value we generated as a placeholder. These must never be used as
+ * a match key, or unrelated leads collide on a shared synthetic identifier.
+ * Covers both the webhook fallback (pending+...@strideautomation.com) and the
+ * Apps Script fallback (pending+tustin-paidleads-rN@strideautomation.com).
+ */
 function isFallbackEmail(email: string) {
   const e = email.trim().toLowerCase();
   return e.startsWith("pending+") || e.endsWith(`@${FALLBACK_EMAIL_DOMAIN}`);
 }
-
 /**
  * True for our synthetic fallback phones: Apps Script "1556" + 7 padded digits,
- * or webhook makeDummyPhone "555" + 7 digits. Real US numbers do not start 555,
- * and 556 is not an assigned area code, so this is safe on canonicalised digits.
+ * or webhook makeDummyPhone "555" + 7 digits. Real US numbers do not start 555.
  */
 function isFallbackPhone(digits: string) {
-  const d = digitsOnly(digits);
-  return /^1556\d{7}$/.test(d) || /^555\d{7}$/.test(d);
+  return /^1556\d{7}$/.test(digits) || /^555\d{7}$/.test(digits);
 }
-
-/*
- * [FIX 2] Common nickname / formal-name equivalences. Bidirectional: we map both
- * sides to a canonical key before comparing. Keep this list conservative — only
- * unambiguous pairs, so we never merge genuinely different people.
- */
-const NICKNAME_CANON: Record<string, string> = (() => {
-  const groups: string[][] = [
-    ["michael", "mike", "mikey"],
-    ["robert", "rob", "bob", "bobby", "robbie"],
-    ["william", "will", "bill", "billy", "willie"],
-    ["richard", "rick", "rich", "dick", "ricky"],
-    ["james", "jim", "jimmy", "jamie"],
-    ["john", "johnny", "jack"],
-    ["joseph", "joe", "joey"],
-    ["charles", "charlie", "chuck"],
-    ["thomas", "tom", "tommy"],
-    ["christopher", "chris"],
-    ["daniel", "dan", "danny"],
-    ["matthew", "matt"],
-    ["anthony", "tony"],
-    ["david", "dave", "davey"],
-    ["edward", "ed", "eddie", "ted"],
-    ["steven", "stephen", "steve"],
-    ["kenneth", "ken", "kenny"],
-    ["nicholas", "nick", "nicky"],
-    ["andrew", "andy", "drew"],
-    ["benjamin", "ben", "benji"],
-    ["samuel", "sam", "sammy"],
-    ["alexander", "alex", "xander"],
-    ["nathaniel", "nathan", "nate"],
-    ["jonathan", "jon", "jonny"],
-    ["timothy", "tim", "timmy"],
-    ["gregory", "greg"],
-    ["patrick", "pat"],
-    ["elizabeth", "liz", "beth", "betsy", "eliza", "lisa"],
-    ["katherine", "catherine", "kate", "katie", "kathy", "cathy", "kat"],
-    ["margaret", "maggie", "meg", "peggy"],
-    ["jennifer", "jen", "jenny"],
-    ["jessica", "jess"],
-    ["deborah", "deb", "debbie"],
-    ["patricia", "pat", "patty", "trish"],
-    ["susan", "sue", "susie"],
-    ["barbara", "barb"],
-    ["victoria", "vicky", "tori"],
-    ["rebecca", "becca", "becky"],
-    ["stephanie", "steph"],
-    ["samantha", "sam"],
-    ["alexandra", "alex", "lexi", "sandra"]
-  ];
-  const map: Record<string, string> = {};
-  for (const g of groups) {
-    const canon = g[0];
-    for (const name of g) map[name] = canon;
-  }
-  return map;
-})();
-
-function canonFirstName(s: string) {
-  const clean = normalize(s).replace(/[^a-z0-9]/g, "");
-  return NICKNAME_CANON[clean] ?? clean;
-}
-
 /**
- * [FIX 2] Name agreement for phone-based matches. Still requires a real first and
- * last name on both sides and equal last names (preserves shared-household
- * protection). First names agree if they are equal, one is a clean prefix of the
- * other, they share a nickname canonical form, or they share a first initial when
- * one side is a single letter (e.g. "J" vs "John"). This stops us from creating a
- * duplicate for the same person just because they used a nickname.
+ * Conservative name agreement for phone-based matches. Both sides must carry a
+ * real first and last name; last names must be equal; first names must be equal
+ * or a clean prefix of one another. Junk like "X" will not agree with a real
+ * surname, which is exactly what we want.
  */
 function namesAgree(
   leadFirst: string,
@@ -335,36 +226,21 @@ function namesAgree(
   const cl = clean(clientLast);
   if (!lf || !ll || !cf || !cl) return false;
   if (ll !== cl) return false;
-
-  // Direct / prefix agreement.
-  if (lf === cf || lf.startsWith(cf) || cf.startsWith(lf)) return true;
-
-  // Nickname / formal-name equivalence.
-  if (canonFirstName(leadFirst) === canonFirstName(clientFirst)) return true;
-
-  // Single-initial agreement ("J Smith" vs "John Smith").
-  if ((lf.length === 1 || cf.length === 1) && lf[0] === cf[0]) return true;
-
-  return false;
+  return lf === cf || lf.startsWith(cf) || cf.startsWith(lf);
 }
-
 function unauthorized(reason: string) {
   return NextResponse.json(
     { ok: false, error: `Unauthorized: ${reason}` },
     { status: 401 }
   );
 }
-
 function badRequest(error: string, extra?: Record<string, unknown>) {
   return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 400 });
 }
-
 function serverError(error: string, extra?: Record<string, unknown>) {
   return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 500 });
 }
-
 /* ---------- Typeform payload extraction ---------- */
-
 function getAnswerValue(answer: any) {
   if (!answer) return null;
   switch (answer.type) {
@@ -381,30 +257,25 @@ function getAnswerValue(answer: any) {
     default: return null;
   }
 }
-
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
   const hidden = payload?.form_response?.hidden ?? {};
   const answers: any[] = payload?.form_response?.answers ?? [];
   const fields: any[] = payload?.form_response?.definition?.fields ?? [];
-
   const fieldById = new Map<string, any>();
   for (const f of fields) {
     if (f?.id) fieldById.set(f.id, f);
   }
-
   const getTitle = (answer: any) => {
     const fieldId = answer?.field?.id;
     const field = fieldId ? fieldById.get(fieldId) : null;
     return (field?.title ?? "").toString();
   };
-
   const getByRef = (ref: string) => {
     const a = answers.find((x) => x?.field?.ref === ref);
     return getAnswerValue(a);
   };
-
   const getByRefList = (refs: string[]) => {
     for (const ref of refs) {
       const value = getByRef(ref);
@@ -412,7 +283,6 @@ function extractLead(payload: any) {
     }
     return null;
   };
-
   const findByTitleIncludes = (patterns: string[]) => {
     for (const answer of answers) {
       const title = normalize(getTitle(answer));
@@ -423,12 +293,10 @@ function extractLead(payload: any) {
     }
     return null;
   };
-
   let firstName = (getByRefList(["first_name", "firstname", "first-name"]) ?? "").toString().trim();
   let lastName = (getByRefList(["last_name", "lastname", "last-name"]) ?? "").toString().trim();
   let email = getByRefList(["email", "email_address", "email-address"]);
   let phone = getByRefList(["phone", "phone_number", "phone-number", "mobile"]);
-
   let studioName =
     hidden.studio ||
     getByRefList([
@@ -441,7 +309,6 @@ function extractLead(payload: any) {
       "home_studio",
       "home-studio"
     ]);
-
   const attributionType =
     hidden.affiliate
       ? "affiliate"
@@ -452,7 +319,6 @@ function extractLead(payload: any) {
           : getByRefList(["coach", "coach_name", "coach-name"])
             ? "coach"
             : null;
-
   const attribution =
     hidden.affiliate ||
     hidden.coach ||
@@ -465,7 +331,6 @@ function extractLead(payload: any) {
       "coach-name"
     ]) ||
     null;
-
   if (!firstName) firstName = findByTitleIncludes(["first name", "firstname"]) ?? "";
   if (!lastName) lastName = findByTitleIncludes(["last name", "lastname"]) ?? "";
   if (!email) {
@@ -486,7 +351,6 @@ function extractLead(payload: any) {
       "choose studio"
     ]);
   }
-
   return {
     formId,
     token,
@@ -500,9 +364,7 @@ function extractLead(payload: any) {
     answersCount: answers.length
   };
 }
-
 /* ---------- DB ---------- */
-
 async function ensureTables() {
   if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
     throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
@@ -536,44 +398,6 @@ async function ensureTables() {
     await sql`alter table processed_submissions_v2 add column if not exists attribution_type text`;
   } catch {}
 }
-
-/*
- * [FIX 4] Idempotency store for the Sheets create path. One row per sheet row
- * reserves the create, and one row per real identity key catches the same person
- * arriving on different sheet rows. Both are unique so concurrent requests race
- * on the DB, not on Mindbody's eventually-consistent search index.
- */
-async function ensureSheetCreateTable() {
-  if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
-    throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
-  }
-  await sql`
-    create table if not exists processed_sheet_rows_v1 (
-      id bigserial primary key,
-      row_key text not null unique,
-      identity_key text,
-      site_id integer not null,
-      sheet_id text,
-      row_number integer,
-      mb_client_id text,
-      status text not null default 'in_progress',
-      created_at timestamptz default now(),
-      updated_at timestamptz default now()
-    );
-  `;
-  // Index (NOT unique) to keep the identity lookup fast. row_key is the hard
-  // exactly-once guarantee; identity is a best-effort reuse check (see below).
-  // We deliberately avoid a unique constraint on identity: an INSERT that only
-  // swallows conflicts on row_key would otherwise raise an *uncaught* unique
-  // violation on a same-identity/different-row collision and 500 the request.
-  try {
-    await sql`
-      create index if not exists processed_sheet_rows_v1_identity_idx
-      on processed_sheet_rows_v1 (site_id, identity_key)
-    `;
-  } catch {}
-}
-
 async function getStudioMapping(studioName: string) {
   const studioKey = slugifyStudioName(studioName);
   const rows = await sql`
@@ -584,9 +408,7 @@ async function getStudioMapping(studioName: string) {
   `;
   return (rows as any)?.[0] ?? null;
 }
-
 /* ---------- Mindbody helpers ---------- */
-
 async function getMindbodyStaffToken(siteId: number) {
   const apiKey = process.env.MINDBODY_API_KEY;
   const staffUsername = process.env.MINDBODY_STAFF_USERNAME;
@@ -615,9 +437,7 @@ async function getMindbodyStaffToken(siteId: number) {
   }
   return String(data.AccessToken);
 }
-
 type MbResult = { status: number; ok: boolean; data: any; text: string };
-
 async function mindbodyFetch(
   siteId: number,
   path: string,
@@ -638,10 +458,7 @@ async function mindbodyFetch(
       "Content-Type": "application/json",
       "Api-Key": apiKey,
       SiteId: String(siteId),
-      // Mindbody /usertoken/issue tokens are Bearer tokens on this account
-      // (confirmed against the live coach-log flow). Do NOT send this header on
-      // the /usertoken/issue call itself — only on subsequent requests.
-      Authorization: `Bearer ${token}`
+      Authorization: token
     },
     body: init.body ? JSON.stringify(init.body) : undefined
   });
@@ -652,54 +469,17 @@ async function mindbodyFetch(
   } catch {}
   return { status: res.status, ok: res.ok, data, text };
 }
-
-/**
- * [FIX 3] Search clients by text, paging through results up to
- * MB_SEARCH_MAX_RECORDS. Returns a synthetic MbResult whose data.Clients holds
- * the accumulated rows. Because searchText matches loosely across name/email/
- * phone, the true match can be past the first page at a busy studio; only paging
- * guarantees the phone/email filter downstream can see it.
- */
-async function mindbodyGetClientsBySearch(siteId: number, searchText: string): Promise<MbResult> {
-  const allClients: any[] = [];
-  let offset = 0;
-  let last: MbResult | null = null;
-
-  while (offset < MB_SEARCH_MAX_RECORDS) {
-    const res = await mindbodyFetch(siteId, "/client/clients", {
-      method: "GET",
-      query: {
-        "request.searchText": searchText,
-        "request.limit": String(MB_SEARCH_PAGE_SIZE),
-        "request.offset": String(offset),
-        "request.includeInactive": "true"
-      }
-    });
-    last = res;
-    if (!res.ok) {
-      // Surface the failure as-is; callers already handle non-OK.
-      return res;
+async function mindbodyGetClientsBySearch(siteId: number, searchText: string) {
+  return mindbodyFetch(siteId, "/client/clients", {
+    method: "GET",
+    query: {
+      "request.searchText": searchText,
+      "request.limit": "20",
+      "request.offset": "0",
+      "request.includeInactive": "true"
     }
-    const batch: any[] = res.data?.Clients ?? [];
-    allClients.push(...batch);
-
-    const totalResults = Number(res.data?.PaginationResponse?.TotalResults ?? NaN);
-    offset += MB_SEARCH_PAGE_SIZE;
-
-    // Stop when the page was short, or we've reached the reported total.
-    if (batch.length < MB_SEARCH_PAGE_SIZE) break;
-    if (Number.isFinite(totalResults) && offset >= totalResults) break;
-  }
-
-  const base = last ?? { status: 200, ok: true, data: {}, text: "" };
-  return {
-    status: base.status,
-    ok: base.ok,
-    data: { ...(base.data ?? {}), Clients: allClients },
-    text: base.text
-  };
+  });
 }
-
 async function mindbodyUpdateClient(
   siteId: number,
   client: {
@@ -711,12 +491,15 @@ async function mindbodyUpdateClient(
   }
 ) {
   const clientBody: any = { Id: client.mbClientId };
+  // FirstName / LastName are required by Mindbody's UpdateClient request body
+  // even when they aren't changing. We pass them through from the sheet.
   if (client.firstName) clientBody.FirstName = client.firstName;
   if (client.lastName) clientBody.LastName = client.lastName;
   if (client.referredBy) clientBody.ReferredBy = client.referredBy;
   if (client.salesRep) {
     const repId = Number(client.salesRep);
     if (Number.isFinite(repId) && repId > 0) {
+      // SalesReps[0] is "Rep 1" on the Mindbody client profile.
       clientBody.SalesReps = [{ Id: repId }];
     }
   }
@@ -725,14 +508,23 @@ async function mindbodyUpdateClient(
     body: { Client: clientBody, CrossRegionalUpdate: false }
   });
 }
-
+/**
+ * Read a client's full info (relationships + name). Used both for idempotency
+ * (is this referrer already linked?) and to grab the FirstName/LastName that
+ * UpdateClient requires on every write.
+ */
 async function mindbodyGetClientCompleteInfo(siteId: number, clientId: string) {
   return mindbodyFetch(siteId, "/client/clientcompleteinfo", {
     method: "GET",
     query: { ClientId: clientId }
   });
 }
-
+/**
+ * Write the "was Referred By" link onto the new client. The ClientRelationships
+ * array merges set-style, so this adds the relationship without removing existing
+ * ones. ClientRelationships cannot be written via the cross-regional path, so we
+ * keep CrossRegionalUpdate false and target the local site.
+ */
 async function mindbodyAddReferralRelationship(
   siteId: number,
   args: {
@@ -745,12 +537,15 @@ async function mindbodyAddReferralRelationship(
 ) {
   const clientBody: any = {
     Id: args.mbClientId,
+    // Required by UpdateClient even when unchanged.
     FirstName: args.firstName,
     LastName: args.lastName,
     ClientRelationships: [
       {
         RelatedClientId: String(args.referrerClientId),
         Relationship: { Id: args.relationshipId },
+        // The type Id (-1) is shared by both "Referred" and "Referred By", so we
+        // pin the direction by name: the new client *was Referred By* the referrer.
         RelationshipName: "Referred By"
       }
     ]
@@ -760,33 +555,17 @@ async function mindbodyAddReferralRelationship(
     body: { Client: clientBody, CrossRegionalUpdate: false }
   });
 }
-
-/*
- * [FIX 1] Build the ordered, de-duplicated list of phone search terms. Mirrors
- * (and extends) what handleSheetsLookup tries, so the create path can never find
- * fewer clients than the lookup path.
- */
-function phoneSearchCandidates(rawPhone: string) {
-  const digits = digitsOnly(rawPhone);
-  const canon = canonicalPhone(rawPhone);
-  return Array.from(
-    new Set(
-      [
-        canon, // 10-digit canonical
-        digits, // full digit string (may include country code)
-        rawPhone.trim() // raw formatted value, in case MB indexed it that way
-      ].filter((s) => s && s.length >= 7)
-    )
-  );
-}
-
 /**
- * Strict find-for-create. Only treats a Mindbody client as the same person when
- * identity is verified:
+ * Strict find-for-create (added 2026-06-16). Only treats a Mindbody client as
+ * the same person when identity is verified. This replaces the blind use of
+ * findClient() on the Sheets create path, which matched loosely on name OR email
+ * OR phone and attached new leads to unrelated members.
+ *
+ * Match rules:
  *   1. Real-email exact match, single hit  -> reuse.
  *   2. Verified phone match, single hit, AND name agrees -> reuse.
  * A phone that matches a different-named person (shared household number) is NOT
- * reused. See FIX 1/2/3 in the change log for what changed on 2026-07-15.
+ * reused; we let the caller create a new client instead.
  */
 async function findClientForCreate(
   siteId: number,
@@ -794,8 +573,7 @@ async function findClientForCreate(
     firstName: string;
     lastName: string;
     email: string;
-    phone: string; // digits only (already substituted/validated by caller)
-    rawPhone: string; // original formatted value for search
+    phone: string; // digits only
     emailIsReal: boolean;
     phoneIsReal: boolean;
   }
@@ -805,7 +583,6 @@ async function findClientForCreate(
   | { kind: "none" }
 > {
   const emailLower = args.email.trim().toLowerCase();
-
   // 1. Real-email exact match.
   if (args.emailIsReal && emailLower) {
     const res = await mindbodyGetClientsBySearch(siteId, emailLower);
@@ -823,67 +600,46 @@ async function findClientForCreate(
       if (exact.length > 1) return { kind: "ambiguous", via: "email", count: exact.length };
     }
   }
-
   // 2. Verified phone match, gated on name agreement.
   if (args.phoneIsReal && args.phone) {
-    // [FIX 1] Aggregate hits across ALL phone search candidates before filtering,
-    // and de-dupe clients by Id so multi-candidate overlap doesn't inflate counts.
-    const byId = new Map<string, any>();
-    const candidates = phoneSearchCandidates(args.rawPhone || args.phone);
-    for (const searchText of candidates) {
-      const res = await mindbodyGetClientsBySearch(siteId, searchText);
-      if (!res.ok) continue;
-      for (const c of (res.data?.Clients ?? [])) {
-        if (c?.Id != null) byId.set(String(c.Id), c);
-      }
+    const res = await mindbodyGetClientsBySearch(siteId, args.phone.slice(-10));
+    if (res.ok) {
+      const clients: any[] = res.data?.Clients ?? [];
+      const phoneMatches = clients.filter((c) => {
+        const cand = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
+        return cand.some((p: string) => phonesMatch(p, args.phone));
+      });
+      const nameMatches = phoneMatches.filter((c) =>
+        namesAgree(
+          args.firstName,
+          args.lastName,
+          String(c?.FirstName || ""),
+          String(c?.LastName || "")
+        )
+      );
+      console.log("findClientForCreate phone pass", {
+        phoneTail: args.phone.slice(-10),
+        returned: clients.length,
+        phoneMatches: phoneMatches.length,
+        nameMatches: nameMatches.length
+      });
+      if (nameMatches.length === 1) return { kind: "match", id: String(nameMatches[0].Id), via: "phone" };
+      if (nameMatches.length > 1) return { kind: "ambiguous", via: "phone", count: nameMatches.length };
+      // phone matched but no name agreement -> treat as a new person.
     }
-    const clients = Array.from(byId.values());
-
-    const phoneMatches = clients.filter((c) => {
-      const cand = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
-      return cand.some((p: string) => phonesMatch(p, args.phone));
-    });
-    const nameMatches = phoneMatches.filter((c) =>
-      namesAgree(
-        args.firstName,
-        args.lastName,
-        String(c?.FirstName || ""),
-        String(c?.LastName || "")
-      )
-    );
-    console.log("findClientForCreate phone pass", {
-      phoneTail: canonicalPhone(args.phone),
-      searchCandidates: candidates.length,
-      returned: clients.length,
-      phoneMatches: phoneMatches.length,
-      nameMatches: nameMatches.length
-    });
-
-    // De-dupe the accepted matches by Id (defensive) before deciding.
-    const nameMatchIds = Array.from(new Set(nameMatches.map((c) => String(c.Id))));
-    if (nameMatchIds.length === 1) return { kind: "match", id: nameMatchIds[0], via: "phone" };
-    if (nameMatchIds.length > 1) return { kind: "ambiguous", via: "phone", count: nameMatchIds.length };
-    // phone matched but no name agreement -> treat as a new person.
   }
-
   return { kind: "none" };
 }
-
 /* ---------- Sheets -> Mindbody: lookup by phone ---------- */
-
 async function handleSheetsLookup(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
-
   const site = resolveSiteId(payload?.siteKey);
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
-
   const lead = payload?.lead ?? {};
-  const rawPhone = String(lead?.phone || "");
-  const phone = digitsOnly(rawPhone);
+  const phone = digitsOnly(String(lead?.phone || ""));
   if (!phone) return badRequest("Missing lead.phone");
-
   console.log("sheets lookup request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -891,15 +647,12 @@ async function handleSheetsLookup(req: Request, payload: any) {
     backfill: !!payload?.backfill,
     phoneDigits: phone
   });
-
   try {
-    // [FIX 1] Use the shared candidate builder so lookup and create stay in sync.
-    const searchCandidates = phoneSearchCandidates(rawPhone);
-
-    // Aggregate + de-dupe across candidates before verifying the phone, so a
-    // single match found on candidate B isn't hidden by noise from candidate A.
-    const byId = new Map<string, any>();
-    let anyOk = false;
+    // Try last 10 digits first, then the full string. Dedupe with a Set.
+    const searchCandidates = Array.from(
+      new Set([phone.slice(-10), phone].filter(Boolean))
+    );
+    let matched: any = null;
     let lastResult: MbResult | null = null;
     for (const searchText of searchCandidates) {
       const result = await mindbodyGetClientsBySearch(siteId, searchText);
@@ -911,37 +664,38 @@ async function handleSheetsLookup(req: Request, payload: any) {
         });
         continue;
       }
-      anyOk = true;
       const clients: any[] = result.data?.Clients ?? [];
-      console.log("mindbody getClients returned", { searchText, count: clients.length });
-      for (const c of clients) {
-        if (c?.Id != null) byId.set(String(c.Id), c);
+      console.log("mindbody getClients returned", {
+        searchText,
+        count: clients.length
+      });
+      // SearchText can match name/email too, so verify the phone explicitly.
+      const phoneMatches = clients.filter((c) => {
+        const candidates = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
+        return candidates.some((p: string) => phonesMatch(p, phone));
+      });
+      if (phoneMatches.length === 1) {
+        matched = phoneMatches[0];
+        break;
+      }
+      if (phoneMatches.length > 1) {
+        return NextResponse.json({
+          ok: true,
+          status: "ambiguous",
+          message: `Multiple Mindbody clients matched phone ${phone}`,
+          count: phoneMatches.length
+        });
       }
     }
-
-    const phoneMatches = Array.from(byId.values()).filter((c) => {
-      const candidates = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
-      return candidates.some((p: string) => phonesMatch(p, phone));
-    });
-
-    if (phoneMatches.length === 1) {
+    if (matched?.Id) {
       return NextResponse.json({
         ok: true,
         status: "found",
-        mbClientId: String(phoneMatches[0].Id),
+        mbClientId: String(matched.Id),
         siteId
       });
     }
-    if (phoneMatches.length > 1) {
-      return NextResponse.json({
-        ok: true,
-        status: "ambiguous",
-        message: `Multiple Mindbody clients matched phone ${phone}`,
-        count: phoneMatches.length
-      });
-    }
-
-    if (!anyOk && lastResult && !lastResult.ok) {
+    if (lastResult && !lastResult.ok) {
       return NextResponse.json(
         {
           ok: false,
@@ -957,30 +711,27 @@ async function handleSheetsLookup(req: Request, payload: any) {
     return serverError(err?.message ?? "Lookup failed");
   }
 }
-
 /* ---------- Sheets -> Mindbody: updateClient ---------- */
-
 async function handleSheetsUpdateClient(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
-
   const site = resolveSiteId(payload?.siteKey);
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
-
   const client = payload?.client ?? {};
   const mbClientId = String(client?.mbClientId || "").trim();
   if (!mbClientId) return badRequest("Missing client.mbClientId");
-
   const firstName = String(client?.firstName || "").trim();
   const lastName = String(client?.lastName || "").trim();
   const referredBy = String(client?.referredBy || "").trim();
   const salesRepRaw = client?.salesRep;
-
   if (!referredBy && !salesRepRaw) {
     return badRequest("Nothing to update (referredBy and salesRep both empty)");
   }
-
+  // PROTECTION (2026-06-16): never overwrite an already-set, meaningful Referred
+  // By. A later generic touch (e.g. Schedule Gate) must not clobber the original
+  // lead source. Read the client's current ReferredBy first; if it is already a
+  // protected type, drop referredBy from this update and keep what is there.
   let referredByToSend: string | undefined = referredBy || undefined;
   let keptReferredBy: string | null = null;
   if (referredByToSend) {
@@ -989,10 +740,14 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       const c = info.data?.Client ?? info.data ?? {};
       const current = String(c?.ReferredBy ?? "").trim();
       if (current && PROTECTED_REFERRAL_TYPES.has(current.toLowerCase())) {
-        referredByToSend = undefined;
+        referredByToSend = undefined; // leave the existing value in place
         keptReferredBy = current;
       }
     } else {
+      // Could not read the current value. Fail safe toward NOT overwriting,
+      // since clobbering a protected source is the costly mistake. salesRep (if
+      // any) still goes through below. Flip this if you'd rather write on read
+      // failure.
       console.log("updateClient protection read failed; skipping referredBy", {
         mbClientId,
         status: info.status
@@ -1001,7 +756,7 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       keptReferredBy = "unknown (read failed)";
     }
   }
-
+  // After protection, if there's nothing left to write, report and stop.
   if (!referredByToSend && !salesRepRaw) {
     console.log("sheets updateClient skipped (protected ReferredBy)", {
       mbClientId,
@@ -1016,7 +771,6 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
       keptReferredBy
     });
   }
-
   console.log("sheets updateClient request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -1028,7 +782,6 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
     keptReferredBy,
     salesRep: salesRepRaw || null
   });
-
   try {
     const result = await mindbodyUpdateClient(siteId, {
       mbClientId,
@@ -1065,26 +818,25 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
     return serverError(err?.message ?? "Update failed");
   }
 }
-
-/* ---------- Sheets -> Mindbody: link referral relationship ---------- */
-
+/* ---------- Sheets -> Mindbody: link referral relationship ----------
+   Trigger payload from Apps Script:
+     { linkReferral: true, siteKey, mbClientId, referrerEmail }
+   Resolves the referrer by email, then writes a "was Referred By" client
+   relationship onto the new client. Reuses the same auth path as every other
+   handler (mindbodyFetch issues a token from MINDBODY_STAFF_USERNAME/PASSWORD).  */
 async function handleSheetsLinkReferral(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
-
   const site = resolveSiteId(payload?.siteKey);
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
-
   const rel = resolveReferralRelationshipId(payload?.siteKey);
   if (!rel.ok) return badRequest(rel.reason);
   const relationshipId = rel.relationshipId;
-
   const mbClientId = String(payload?.mbClientId || "").trim();
   const referrerEmail = String(payload?.referrerEmail || "").trim().toLowerCase();
   if (!mbClientId) return badRequest("Missing mbClientId");
   if (!referrerEmail) return badRequest("Missing referrerEmail");
-
   console.log("sheets linkReferral request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -1092,8 +844,9 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
     mbClientId,
     referrerEmail
   });
-
   try {
+    // 1. Resolve referrer email -> RSSID. SearchText is fuzzy, so require an
+    //    exact email match, and bail on 0 / many like the phone lookup does.
     const search = await mindbodyGetClientsBySearch(siteId, referrerEmail);
     if (!search.ok) {
       return NextResponse.json(
@@ -1124,7 +877,8 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
     if (referrerClientId === mbClientId) {
       return NextResponse.json({ ok: true, status: "self_referral", mbClientId });
     }
-
+    // 2. One read gives us existing relationships (idempotency) + the name
+    //    fields UpdateClient requires.
     const info = await mindbodyGetClientCompleteInfo(siteId, mbClientId);
     if (!info.ok) {
       return NextResponse.json(
@@ -1151,7 +905,7 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
     if (alreadyLinked) {
       return NextResponse.json({ ok: true, status: "already_linked", mbClientId, referrerClientId });
     }
-
+    // 3. Write the link.
     const result = await mindbodyAddReferralRelationship(siteId, {
       mbClientId,
       firstName,
@@ -1186,26 +940,24 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
     return serverError(err?.message ?? "Link failed");
   }
 }
-
-/* ---------- Sheets -> Mindbody: get client relationships (discovery) ---------- */
-
+/* ---------- Sheets -> Mindbody: get client relationships (discovery) ----------
+   Trigger payload from Apps Script:
+     { getRelationships: true, siteKey, mbClientId }
+   Returns the client's relationships (type Id + both directional names) so you
+   can read off the "Referred By" Relationship.Id. Reuses mindbodyGetClientCompleteInfo. */
 async function handleSheetsGetRelationships(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
-
   const site = resolveSiteId(payload?.siteKey);
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
-
   const mbClientId = String(payload?.mbClientId || "").trim();
   if (!mbClientId) return badRequest("Missing mbClientId");
-
   console.log("sheets getRelationships request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
     mbClientId
   });
-
   try {
     const info = await mindbodyGetClientCompleteInfo(siteId, mbClientId);
     if (!info.ok) {
@@ -1240,52 +992,32 @@ async function handleSheetsGetRelationships(req: Request, payload: any) {
     return serverError(err?.message ?? "Get relationships failed");
   }
 }
-
 /* ---------- Sheets -> Mindbody: find-or-create from Paid Leads row ---------- */
-
 async function handleSheetsCreate(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
-
   const site = resolveSiteId(payload?.siteKey);
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
-
   const lead = payload?.lead ?? {};
   const firstName = String(lead?.firstName || "").trim();
   const lastName = String(lead?.lastName || "").trim();
   if (!firstName || !lastName) {
     return badRequest("Missing lead.firstName or lead.lastName");
   }
-
   const rawEmail = String(lead?.email || "").trim();
   const rawPhone = String(lead?.phone || "").trim();
   const phoneDigitsRaw = digitsOnly(rawPhone);
-  const phoneCanon = canonicalPhone(rawPhone);
-
-  // Decide which identifiers are REAL and therefore safe to match on.
+  // Decide which identifiers are REAL and therefore safe to match on. Junk like
+  // "X" (no "@") and our own synthetic fallbacks must never be used as a match
+  // key, or unrelated leads collide on a shared placeholder.
   const emailIsReal = rawEmail.includes("@") && !isFallbackEmail(rawEmail);
-  const phoneIsReal = !!phoneCanon && !isFallbackPhone(phoneCanon);
-
+  const phoneIsReal = phoneDigitsRaw.length >= 10 && !isFallbackPhone(phoneDigitsRaw);
   // For the actual create, substitute deterministic fallbacks for anything not
   // real, so we never write "X" into Mindbody as an email/phone.
   const seed = `${payload?.sheetId}:${payload?.rowNumber}:${firstName}:${lastName}`;
   const email = emailIsReal ? rawEmail : makeDummyEmail(seed);
-  const phone = phoneIsReal ? phoneCanon : digitsOnly(makeDummyPhone(seed));
-
-  // [FIX 4] Idempotency keys.
-  //   rowKey   -> exactly-once per sheet row (kills retry / double-fire dupes).
-  //   identityKey -> exactly-once per real person (kills same-person-two-rows dupes
-  //                  and covers Mindbody's eventually-consistent search index).
-  const sheetIdStr = String(payload?.sheetId ?? "");
-  const rowNumberNum = Number(payload?.rowNumber);
-  const rowKey = `${siteId}:${sheetIdStr}:${payload?.rowNumber ?? ""}`;
-  const identityKey = emailIsReal
-    ? `email:${email.toLowerCase()}`
-    : phoneIsReal
-      ? `phone:${phone}`
-      : null;
-
+  const phone = phoneIsReal ? phoneDigitsRaw : digitsOnly(makeDummyPhone(seed));
   console.log("sheets create request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -1297,105 +1029,22 @@ async function handleSheetsCreate(req: Request, payload: any) {
     phoneDigits: phone,
     emailIsReal,
     phoneIsReal,
-    rowKey,
-    identityKey,
     leadSource: lead?.leadSource ?? null,
     referralType: lead?.referralType ?? null,
     salesRep: lead?.salesRep ?? null
   });
-
   try {
-    await ensureSheetCreateTable();
-
-    // --- Reserve the row (exactly-once). If it already exists, short-circuit. ---
-    const reserved = await sql`
-      insert into processed_sheet_rows_v1 (row_key, identity_key, site_id, sheet_id, row_number, status)
-      values (${rowKey}, ${identityKey}, ${siteId}, ${sheetIdStr}, ${Number.isFinite(rowNumberNum) ? rowNumberNum : null}, 'in_progress')
-      on conflict (row_key) do nothing
-      returning id
-    `;
-    if (!(reserved as any)?.length) {
-      // Another request already owns this row. Return its outcome if known.
-      const existingRows = await sql`
-        select mb_client_id, status from processed_sheet_rows_v1 where row_key = ${rowKey} limit 1
-      `;
-      const existing = (existingRows as any)?.[0];
-      if (existing?.mb_client_id) {
-        return NextResponse.json({
-          ok: true,
-          status: "exists",
-          matchedVia: "idempotency_row",
-          mbClientId: String(existing.mb_client_id),
-          siteId
-        });
-      }
-      return NextResponse.json({
-        ok: true,
-        status: "in_progress",
-        message: "This sheet row is already being processed",
-        rowKey,
-        siteId
-      });
-    }
-
-    // --- Reserve the identity (exactly-once per real person across rows). ---
-    // If another row already claimed this identity, reuse its client id instead
-    // of creating a second Mindbody client.
-    if (identityKey) {
-      const claimedRows = await sql`
-        select mb_client_id, status, row_key
-        from processed_sheet_rows_v1
-        where site_id = ${siteId} and identity_key = ${identityKey} and row_key <> ${rowKey}
-        order by created_at asc
-        limit 1
-      `;
-      const claimed = (claimedRows as any)?.[0];
-      if (claimed?.mb_client_id) {
-        await sql`
-          update processed_sheet_rows_v1
-          set mb_client_id = ${String(claimed.mb_client_id)}, status = 'exists', updated_at = now()
-          where row_key = ${rowKey}
-        `;
-        return NextResponse.json({
-          ok: true,
-          status: "exists",
-          matchedVia: "idempotency_identity",
-          mbClientId: String(claimed.mb_client_id),
-          siteId
-        });
-      }
-      if (claimed && claimed.status === "in_progress") {
-        // Another row with the same real identity is mid-flight and hasn't
-        // written its client id yet. Don't create in parallel — release our own
-        // reservation and let this row retry once the other finishes.
-        await sql`delete from processed_sheet_rows_v1 where row_key = ${rowKey}`;
-        return NextResponse.json({
-          ok: true,
-          status: "in_progress",
-          message: "Another row with the same identity is being processed; retry shortly",
-          identityKey,
-          siteId
-        });
-      }
-    }
-
-    // --- Verified find against Mindbody. ---
     const found = await findClientForCreate(siteId, {
       firstName,
       lastName,
       email,
       phone,
-      rawPhone,
       emailIsReal,
       phoneIsReal
     });
-
     if (found.kind === "ambiguous") {
-      await sql`
-        update processed_sheet_rows_v1
-        set status = 'ambiguous', updated_at = now()
-        where row_key = ${rowKey}
-      `;
+      // Don't guess. Surface it so the row gets human review instead of being
+      // silently attached to the wrong person.
       return NextResponse.json({
         ok: true,
         status: "ambiguous",
@@ -1405,13 +1054,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
         message: `Multiple Mindbody clients matched on ${found.via}; not auto-linking`
       });
     }
-
     if (found.kind === "match") {
-      await sql`
-        update processed_sheet_rows_v1
-        set mb_client_id = ${found.id}, status = 'exists', updated_at = now()
-        where row_key = ${rowKey}
-      `;
       return NextResponse.json({
         ok: true,
         status: "exists",
@@ -1424,28 +1067,13 @@ async function handleSheetsCreate(req: Request, payload: any) {
         }
       });
     }
-
-    // --- Create. ---
-    let created: any = null;
-    try {
-      created = await createClient(siteId, { firstName, lastName, email, phone });
-    } catch (createErr) {
-      // Roll back our reservation so a later retry can try again rather than
-      // being stuck as a permanent 'in_progress' phantom.
-      await sql`delete from processed_sheet_rows_v1 where row_key = ${rowKey}`;
-      throw createErr;
-    }
-    if (!created?.Id) {
-      await sql`delete from processed_sheet_rows_v1 where row_key = ${rowKey}`;
-      return serverError("Mindbody create failed");
-    }
-
-    await sql`
-      update processed_sheet_rows_v1
-      set mb_client_id = ${String(created.Id)}, status = 'created', updated_at = now()
-      where row_key = ${rowKey}
-    `;
-
+    const created = await createClient(siteId, {
+      firstName,
+      lastName,
+      email,
+      phone
+    });
+    if (!created?.Id) return serverError("Mindbody create failed");
     return NextResponse.json({
       ok: true,
       status: "created",
@@ -1471,16 +1099,13 @@ async function handleSheetsCreate(req: Request, payload: any) {
     );
   }
 }
-
 /* ---------- Typeform handler ---------- */
-
 async function handleTypeform(req: Request, rawBody: string) {
   const verification = await verifyTypeform(req, rawBody);
   console.log("verification result:", verification);
   if (!verification.ok) {
     return unauthorized("Typeform verification failed");
   }
-
   let payload: any;
   try {
     payload = JSON.parse(rawBody);
@@ -1488,7 +1113,6 @@ async function handleTypeform(req: Request, rawBody: string) {
     console.log("payload parse failed:", parseErr);
     return badRequest("Invalid JSON");
   }
-
   const lead = extractLead(payload);
   console.log("lead extracted:", {
     formId: lead.formId,
@@ -1502,11 +1126,9 @@ async function handleTypeform(req: Request, rawBody: string) {
     attributionType: lead.attributionType,
     answersCount: lead.answersCount
   });
-
   if (!lead.formId || !lead.token || lead.answersCount === 0) {
     return NextResponse.json({ ok: true, status: "typeform_test_ok" });
   }
-
   const baseExtracted = {
     firstName: lead.firstName,
     lastName: lead.lastName,
@@ -1516,7 +1138,6 @@ async function handleTypeform(req: Request, rawBody: string) {
     attribution: lead.attribution,
     attributionType: lead.attributionType
   };
-
   if (!lead.firstName || !lead.lastName) {
     return badRequest("Missing firstName or lastName from Typeform payload", {
       extracted: baseExtracted
@@ -1532,9 +1153,7 @@ async function handleTypeform(req: Request, rawBody: string) {
       extracted: baseExtracted
     });
   }
-
   await ensureTables();
-
   const mapping = await getStudioMapping(lead.studioName);
   console.log("studio mapping result:", mapping);
   if (!mapping || mapping.is_active === false) {
@@ -1549,9 +1168,7 @@ async function handleTypeform(req: Request, rawBody: string) {
       attributionType: lead.attributionType
     });
   }
-
   const siteId = Number(mapping.site_id);
-
   try {
     await sql`
       insert into processed_submissions_v2 (
@@ -1581,13 +1198,11 @@ async function handleTypeform(req: Request, rawBody: string) {
       attributionType: lead.attributionType
     });
   }
-
   const normalizedEmail =
     lead.email && lead.email.trim().length > 0 ? lead.email.trim() : makeDummyEmail(lead.token);
   const normalizedPhoneRaw =
     lead.phone && lead.phone.trim().length > 0 ? lead.phone.trim() : makeDummyPhone(lead.token);
   const normalizedPhone = digitsOnly(normalizedPhoneRaw);
-
   console.log("about to search/create in MB", {
     siteId,
     firstName: lead.firstName,
@@ -1595,12 +1210,11 @@ async function handleTypeform(req: Request, rawBody: string) {
     email: normalizedEmail,
     phone: normalizedPhone
   });
-
   try {
-    // NOTE (2026-07-15): Typeform still uses the loose findClient(). Loose matching
-    // over-merges rather than duplicates, so it is not implicated in the duplicate
-    // reports; the token dedup above already blocks the retry case. Migrating this
-    // to findClientForCreate() is tracked separately.
+    // NOTE (2026-06-16): This path still uses the loose findClient() and shares
+    // the same latent mismatch risk fixed on the Sheets create path. Left as-is
+    // for now to avoid changing live Typeform dedup behavior; migrate it to
+    // findClientForCreate() when ready.
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
@@ -1621,7 +1235,6 @@ async function handleTypeform(req: Request, rawBody: string) {
         }
       });
     }
-
     const created = await createClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
@@ -1629,7 +1242,6 @@ async function handleTypeform(req: Request, rawBody: string) {
       phone: normalizedPhone
     });
     if (!created?.Id) return serverError("Mindbody create failed");
-
     return NextResponse.json({
       ok: true,
       status: "created",
@@ -1660,9 +1272,7 @@ async function handleTypeform(req: Request, rawBody: string) {
     );
   }
 }
-
 /* ---------- POST entrypoint ---------- */
-
 export async function POST(req: Request) {
   try {
     console.log("🔥 webhook hit");
@@ -1682,17 +1292,15 @@ export async function POST(req: Request) {
       ),
       nodeEnv: process.env.NODE_ENV
     });
-
     const rawBody = await req.text();
     console.log("raw body length:", rawBody.length);
-
+    // Peek at the body to route Sheets requests before Typeform verification.
     let earlyPayload: any = null;
     try {
       earlyPayload = JSON.parse(rawBody);
     } catch {
       // Not JSON — let the Typeform path return the appropriate error below.
     }
-
     if (earlyPayload?.lookupOnly === true) {
       return await handleSheetsLookup(req, earlyPayload);
     }
@@ -1705,10 +1313,13 @@ export async function POST(req: Request) {
     if (earlyPayload?.getRelationships === true) {
       return await handleSheetsGetRelationships(req, earlyPayload);
     }
+    // Sheets lead-capture posts from the Apps Script:
+    //   { sheetId, sheetName, rowNumber, lead, siteKey?, backfill? }
+    // Neither lookupOnly nor updateClient — these create (or find) a
+    // Mindbody client from a row in the Paid Leads sheet.
     if (earlyPayload?.sheetId && earlyPayload?.lead) {
       return await handleSheetsCreate(req, earlyPayload);
     }
-
     return await handleTypeform(req, rawBody);
   } catch (err: any) {
     console.log("top-level webhook error:", { message: err?.message, stack: err?.stack });
