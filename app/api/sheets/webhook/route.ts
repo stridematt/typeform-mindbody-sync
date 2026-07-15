@@ -638,7 +638,10 @@ async function mindbodyFetch(
       "Content-Type": "application/json",
       "Api-Key": apiKey,
       SiteId: String(siteId),
-      Authorization: token
+      // Mindbody /usertoken/issue tokens are Bearer tokens on this account
+      // (confirmed against the live coach-log flow). Do NOT send this header on
+      // the /usertoken/issue call itself — only on subsequent requests.
+      Authorization: `Bearer ${token}`
     },
     body: init.body ? JSON.stringify(init.body) : undefined
   });
