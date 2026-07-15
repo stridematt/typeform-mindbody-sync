@@ -251,7 +251,7 @@ async function mindbodySearchClients(siteId: number, token: string, searchText: 
     url.searchParams.set("request.offset", String(offset));
     url.searchParams.set("request.includeInactive", "true");
     const res = await fetch(url.toString(), {
-      headers: { "Api-Key": apiKey, Authorization: token, SiteId: String(siteId) },
+      headers: { "Api-Key": apiKey, Authorization: `Bearer ${token}`, SiteId: String(siteId) },
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`Mindbody client search failed: ${res.status} ${text}`);
