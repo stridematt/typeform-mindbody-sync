@@ -2,7 +2,9 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { neon } from "@neondatabase/serverless";
 import { findClient, createClient } from "../../../../lib/mindbody";
+
 export const runtime = "nodejs";
+
 /*
  * CHANGE LOG (2026-06-16):
  *   handleSheetsCreate no longer trusts the loose findClient() result. New leads
@@ -30,16 +32,38 @@ export const runtime = "nodejs";
  *   the referredBy write is skipped so a later generic touch (Schedule Gate)
  *   cannot overwrite the original lead source. Adds one clientcompleteinfo read
  *   per update that carries a referredBy.
+ *
+ * CHANGE LOG (2026-07-16): DEDUP LEDGER on the Sheets create path.
+ *   findClientForCreate() only sees Mindbody's client search index, which is
+ *   EVENTUALLY CONSISTENT — a client created seconds ago is not reliably
+ *   returned yet. Rapid re-submissions of the same person (same phone, different
+ *   emails, or no phone) therefore each missed and created a duplicate
+ *   (observed: one person created as 3 separate Mindbody clients minutes apart).
+ *
+ *   Fix: a write-through Postgres ledger (sheets_client_ledger). Every resolved
+ *   client — created OR matched — is recorded keyed by normalized email and by
+ *   phone-tail+name. handleSheetsCreate now checks the ledger BEFORE the Mindbody
+ *   search, so a just-created client is found immediately, and it records the
+ *   current row's identity on every outcome so alternate emails/phones for the
+ *   same person collapse onto one client id. The ledger is best-effort: any DB
+ *   error degrades gracefully to the previous Mindbody-search behavior.
+ *   Run outputs/sheets_client_ledger.sql once in Neon (see steps in chat), or
+ *   let ensureLedgerTable() create it on first request.
  */
+
 const sql = neon(
   process.env.DATABASE_URL_V2 || process.env.DATABASE_URL || ""
 );
+
 const FALLBACK_EMAIL_DOMAIN = "strideautomation.com";
 const FALLBACK_PHONE_PREFIX = "555";
+
 // Default site for Sheets-originated flows when siteKey is missing.
 // Kept for backward-compat with the original HB-only sheet.
 const HB_SITE_ID = Number(process.env.MINDBODY_SITE_ID_HB || 0);
+
 const MB_BASE = "https://api.mindbodyonline.com/public/v6";
+
 /*
  * Referral types that represent a meaningful, original lead source. Once a
  * client's Mindbody "Referred By" is already set to one of these, a later
@@ -51,13 +75,16 @@ const PROTECTED_REFERRAL_TYPES = new Set([
   "another client",
   "social media lead"
 ]);
+
 /* ---------- Crypto / auth helpers ---------- */
+
 function timingSafeEqual(a: string, b: string) {
   const aBuf = Buffer.from(a);
   const bBuf = Buffer.from(b);
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
+
 async function verifyTypeform(req: Request, rawBody: string) {
   const secret = process.env.TYPEFORM_WEBHOOK_SECRET;
   if (!secret) throw new Error("Missing TYPEFORM_WEBHOOK_SECRET");
@@ -78,6 +105,7 @@ async function verifyTypeform(req: Request, rawBody: string) {
   if (headerSecret && headerSecret === secret) return { ok: true };
   return { ok: false };
 }
+
 function verifySheetsSecret(req: Request) {
   const secret = process.env.SHEETS_WEBHOOK_SECRET;
   if (!secret) return { ok: false, reason: "Missing SHEETS_WEBHOOK_SECRET on server" };
@@ -88,7 +116,9 @@ function verifySheetsSecret(req: Request) {
   if (!timingSafeEqual(provided, secret)) return { ok: false, reason: "Bad secret" };
   return { ok: true };
 }
+
 /* ---------- Multi-studio site resolution ---------- */
+
 /**
  * Resolve a payload siteKey (e.g. "TUSTIN") to a Mindbody Site ID, by looking
  * up the env var MINDBODY_SITE_ID_{KEY}. Falls back to HB when siteKey is
@@ -117,6 +147,7 @@ function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: f
   }
   return { ok: true, siteId: parsed };
 }
+
 /**
  * Resolve a payload siteKey to the Mindbody "Referred By" relationship type ID,
  * via MINDBODY_REFBY_RELATIONSHIP_ID_{KEY}. Mirrors resolveSiteId, including the
@@ -156,7 +187,9 @@ function resolveReferralRelationshipId(
   }
   return { ok: true, relationshipId: rel.id };
 }
+
 /* ---------- Generic helpers ---------- */
+
 function normalize(s: string) {
   return s
     .toLowerCase()
@@ -164,12 +197,19 @@ function normalize(s: string) {
     .replace(/\s+/g, " ")
     .replace(/&/g, "and");
 }
+
+function normalizeEmail(s: string) {
+  return String(s || "").trim().toLowerCase();
+}
+
 function slugifyStudioName(s: string) {
   return normalize(s).replace(/[^a-z0-9]+/g, "");
 }
+
 function digitsOnly(s: string) {
   return (s || "").replace(/\D/g, "");
 }
+
 function phonesMatch(a: string, b: string) {
   const da = digitsOnly(a);
   const db = digitsOnly(b);
@@ -179,17 +219,21 @@ function phonesMatch(a: string, b: string) {
   const tailB = db.slice(-10);
   return tailA.length === 10 && tailA === tailB;
 }
+
 function makeDummyPhone(seed: string) {
   const hex = crypto.createHash("sha256").update(seed).digest("hex");
   const digits = hex.replace(/\D/g, "").padEnd(20, "0");
   const last7 = digits.slice(-7);
   return `${FALLBACK_PHONE_PREFIX}${last7}`;
 }
+
 function makeDummyEmail(seed: string) {
   const short = crypto.createHash("sha256").update(seed).digest("hex").slice(0, 10);
   return `pending+${short}@${FALLBACK_EMAIL_DOMAIN}`;
 }
+
 /* ---------- Identity-match guards (added 2026-06-16) ---------- */
+
 /**
  * True for any value we generated as a placeholder. These must never be used as
  * a match key, or unrelated leads collide on a shared synthetic identifier.
@@ -200,6 +244,7 @@ function isFallbackEmail(email: string) {
   const e = email.trim().toLowerCase();
   return e.startsWith("pending+") || e.endsWith(`@${FALLBACK_EMAIL_DOMAIN}`);
 }
+
 /**
  * True for our synthetic fallback phones: Apps Script "1556" + 7 padded digits,
  * or webhook makeDummyPhone "555" + 7 digits. Real US numbers do not start 555.
@@ -207,6 +252,7 @@ function isFallbackEmail(email: string) {
 function isFallbackPhone(digits: string) {
   return /^1556\d{7}$/.test(digits) || /^555\d{7}$/.test(digits);
 }
+
 /**
  * Conservative name agreement for phone-based matches. Both sides must carry a
  * real first and last name; last names must be equal; first names must be equal
@@ -228,19 +274,163 @@ function namesAgree(
   if (ll !== cl) return false;
   return lf === cf || lf.startsWith(cf) || cf.startsWith(lf);
 }
+
 function unauthorized(reason: string) {
   return NextResponse.json(
     { ok: false, error: `Unauthorized: ${reason}` },
     { status: 401 }
   );
 }
+
 function badRequest(error: string, extra?: Record<string, unknown>) {
   return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 400 });
 }
+
 function serverError(error: string, extra?: Record<string, unknown>) {
   return NextResponse.json({ ok: false, error, ...(extra ?? {}) }, { status: 500 });
 }
+
+/* ---------- Dedup ledger (added 2026-07-16) ----------
+   Write-through record of every client the Sheets create path resolves, so a
+   just-created client is found immediately instead of waiting for Mindbody's
+   eventually-consistent search index. Best-effort: all callers use the *Safe
+   wrappers so a DB hiccup degrades to the previous Mindbody-search behavior. */
+
+type LedgerKey = {
+  emailIsReal: boolean;
+  phoneIsReal: boolean;
+  emailNorm: string | null; // lowercased real email, else null
+  phoneTail: string | null; // last 10 digits of real phone, else null
+  firstName: string;
+  lastName: string;
+};
+
+// Create-if-not-exists runs at most once per warm instance. Manual creation in
+// Neon (outputs/sheets_client_ledger.sql) is preferred; this is a safety net.
+let ledgerReady = false;
+async function ensureLedgerTable() {
+  if (ledgerReady) return;
+  await sql`
+    create table if not exists sheets_client_ledger (
+      id           bigserial primary key,
+      site_id      integer not null,
+      email_norm   text,
+      phone_tail   text,
+      first_norm   text,
+      last_norm    text,
+      mb_client_id text not null,
+      created_at   timestamptz default now()
+    )
+  `;
+  await sql`
+    create unique index if not exists sheets_client_ledger_email
+      on sheets_client_ledger (site_id, email_norm)
+      where email_norm is not null
+  `;
+  await sql`
+    create index if not exists sheets_client_ledger_phone
+      on sheets_client_ledger (site_id, phone_tail)
+      where phone_tail is not null
+  `;
+  ledgerReady = true;
+}
+
+/**
+ * Look up a prior-resolved client for this identity.
+ *   1. Real-email exact match (unique per site) -> reuse.
+ *   2. Phone-tail match, gated on name agreement, single distinct client -> reuse.
+ * Returns null on no match or on any ambiguity (multiple distinct ids).
+ */
+async function ledgerFind(
+  siteId: number,
+  k: LedgerKey
+): Promise<{ id: string; via: "ledger_email" | "ledger_phone" } | null> {
+  if (k.emailIsReal && k.emailNorm) {
+    const r = await sql`
+      select mb_client_id from sheets_client_ledger
+      where site_id = ${siteId} and email_norm = ${k.emailNorm}
+      limit 1
+    `;
+    const row = (r as any[])[0];
+    if (row) return { id: String(row.mb_client_id), via: "ledger_email" };
+  }
+
+  if (k.phoneIsReal && k.phoneTail) {
+    const rows = await sql`
+      select mb_client_id, first_norm, last_norm from sheets_client_ledger
+      where site_id = ${siteId} and phone_tail = ${k.phoneTail}
+    `;
+    const agree = (rows as any[]).filter((x) =>
+      namesAgree(k.firstName, k.lastName, String(x.first_norm || ""), String(x.last_norm || ""))
+    );
+    const ids = Array.from(new Set(agree.map((x) => String(x.mb_client_id))));
+    if (ids.length === 1) return { id: ids[0], via: "ledger_phone" };
+    // 0, or >1 distinct clients on a shared number -> don't guess.
+  }
+
+  return null;
+}
+
+/**
+ * Record this identity -> client id. Called on EVERY resolution (created or
+ * matched) so alternate emails/phones for the same person converge on one id.
+ * Email rows are unique per site (ON CONFLICT DO NOTHING). Phone-only rows are
+ * de-duplicated with a pre-check so they don't accumulate.
+ */
+async function ledgerRecord(siteId: number, k: LedgerKey, mbClientId: string) {
+  const emailNorm = k.emailIsReal ? k.emailNorm : null;
+  const phoneTail = k.phoneIsReal ? k.phoneTail : null;
+  const firstNorm = normalize(k.firstName);
+  const lastNorm = normalize(k.lastName);
+
+  if (emailNorm) {
+    await sql`
+      insert into sheets_client_ledger
+        (site_id, email_norm, phone_tail, first_norm, last_norm, mb_client_id)
+      values (${siteId}, ${emailNorm}, ${phoneTail}, ${firstNorm}, ${lastNorm}, ${mbClientId})
+      on conflict do nothing
+    `;
+    return;
+  }
+
+  if (phoneTail) {
+    const existing = await sql`
+      select 1 from sheets_client_ledger
+      where site_id = ${siteId} and email_norm is null and phone_tail = ${phoneTail}
+        and first_norm = ${firstNorm} and last_norm = ${lastNorm}
+        and mb_client_id = ${mbClientId}
+      limit 1
+    `;
+    if (!(existing as any[])[0]) {
+      await sql`
+        insert into sheets_client_ledger
+          (site_id, email_norm, phone_tail, first_norm, last_norm, mb_client_id)
+        values (${siteId}, null, ${phoneTail}, ${firstNorm}, ${lastNorm}, ${mbClientId})
+      `;
+    }
+  }
+  // Neither real email nor real phone -> nothing safe to key on; skip.
+}
+
+async function ledgerFindSafe(siteId: number, k: LedgerKey) {
+  try {
+    return await ledgerFind(siteId, k);
+  } catch (e: any) {
+    console.log("ledgerFind error (degrading to Mindbody search)", { message: e?.message });
+    return null;
+  }
+}
+
+async function ledgerRecordSafe(siteId: number, k: LedgerKey, mbClientId: string) {
+  try {
+    await ledgerRecord(siteId, k, mbClientId);
+  } catch (e: any) {
+    console.log("ledgerRecord error (non-fatal)", { message: e?.message });
+  }
+}
+
 /* ---------- Typeform payload extraction ---------- */
+
 function getAnswerValue(answer: any) {
   if (!answer) return null;
   switch (answer.type) {
@@ -257,6 +447,7 @@ function getAnswerValue(answer: any) {
     default: return null;
   }
 }
+
 function extractLead(payload: any) {
   const formId = payload?.form_response?.form_id;
   const token = payload?.form_response?.token;
@@ -364,7 +555,9 @@ function extractLead(payload: any) {
     answersCount: answers.length
   };
 }
+
 /* ---------- DB ---------- */
+
 async function ensureTables() {
   if (!process.env.DATABASE_URL_V2 && !process.env.DATABASE_URL) {
     throw new Error("Missing DATABASE_URL_V2 or DATABASE_URL.");
@@ -398,6 +591,7 @@ async function ensureTables() {
     await sql`alter table processed_submissions_v2 add column if not exists attribution_type text`;
   } catch {}
 }
+
 async function getStudioMapping(studioName: string) {
   const studioKey = slugifyStudioName(studioName);
   const rows = await sql`
@@ -408,7 +602,9 @@ async function getStudioMapping(studioName: string) {
   `;
   return (rows as any)?.[0] ?? null;
 }
+
 /* ---------- Mindbody helpers ---------- */
+
 async function getMindbodyStaffToken(siteId: number) {
   const apiKey = process.env.MINDBODY_API_KEY;
   const staffUsername = process.env.MINDBODY_STAFF_USERNAME;
@@ -437,7 +633,9 @@ async function getMindbodyStaffToken(siteId: number) {
   }
   return String(data.AccessToken);
 }
+
 type MbResult = { status: number; ok: boolean; data: any; text: string };
+
 async function mindbodyFetch(
   siteId: number,
   path: string,
@@ -469,6 +667,7 @@ async function mindbodyFetch(
   } catch {}
   return { status: res.status, ok: res.ok, data, text };
 }
+
 async function mindbodyGetClientsBySearch(siteId: number, searchText: string) {
   return mindbodyFetch(siteId, "/client/clients", {
     method: "GET",
@@ -480,6 +679,7 @@ async function mindbodyGetClientsBySearch(siteId: number, searchText: string) {
     }
   });
 }
+
 async function mindbodyUpdateClient(
   siteId: number,
   client: {
@@ -508,6 +708,7 @@ async function mindbodyUpdateClient(
     body: { Client: clientBody, CrossRegionalUpdate: false }
   });
 }
+
 /**
  * Read a client's full info (relationships + name). Used both for idempotency
  * (is this referrer already linked?) and to grab the FirstName/LastName that
@@ -519,6 +720,7 @@ async function mindbodyGetClientCompleteInfo(siteId: number, clientId: string) {
     query: { ClientId: clientId }
   });
 }
+
 /**
  * Write the "was Referred By" link onto the new client. The ClientRelationships
  * array merges set-style, so this adds the relationship without removing existing
@@ -555,6 +757,7 @@ async function mindbodyAddReferralRelationship(
     body: { Client: clientBody, CrossRegionalUpdate: false }
   });
 }
+
 /**
  * Strict find-for-create (added 2026-06-16). Only treats a Mindbody client as
  * the same person when identity is verified. This replaces the blind use of
@@ -566,6 +769,10 @@ async function mindbodyAddReferralRelationship(
  *   2. Verified phone match, single hit, AND name agrees -> reuse.
  * A phone that matches a different-named person (shared household number) is NOT
  * reused; we let the caller create a new client instead.
+ *
+ * NOTE (2026-07-16): this only sees Mindbody's eventually-consistent search
+ * index. The ledger check in handleSheetsCreate now runs BEFORE this, catching
+ * just-created clients this search can't see yet.
  */
 async function findClientForCreate(
   siteId: number,
@@ -630,7 +837,9 @@ async function findClientForCreate(
   }
   return { kind: "none" };
 }
+
 /* ---------- Sheets -> Mindbody: lookup by phone ---------- */
+
 async function handleSheetsLookup(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
@@ -711,7 +920,9 @@ async function handleSheetsLookup(req: Request, payload: any) {
     return serverError(err?.message ?? "Lookup failed");
   }
 }
+
 /* ---------- Sheets -> Mindbody: updateClient ---------- */
+
 async function handleSheetsUpdateClient(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
@@ -818,12 +1029,14 @@ async function handleSheetsUpdateClient(req: Request, payload: any) {
     return serverError(err?.message ?? "Update failed");
   }
 }
+
 /* ---------- Sheets -> Mindbody: link referral relationship ----------
    Trigger payload from Apps Script:
      { linkReferral: true, siteKey, mbClientId, referrerEmail }
    Resolves the referrer by email, then writes a "was Referred By" client
    relationship onto the new client. Reuses the same auth path as every other
    handler (mindbodyFetch issues a token from MINDBODY_STAFF_USERNAME/PASSWORD).  */
+
 async function handleSheetsLinkReferral(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
@@ -940,11 +1153,13 @@ async function handleSheetsLinkReferral(req: Request, payload: any) {
     return serverError(err?.message ?? "Link failed");
   }
 }
+
 /* ---------- Sheets -> Mindbody: get client relationships (discovery) ----------
    Trigger payload from Apps Script:
      { getRelationships: true, siteKey, mbClientId }
    Returns the client's relationships (type Id + both directional names) so you
    can read off the "Referred By" Relationship.Id. Reuses mindbodyGetClientCompleteInfo. */
+
 async function handleSheetsGetRelationships(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
@@ -992,7 +1207,9 @@ async function handleSheetsGetRelationships(req: Request, payload: any) {
     return serverError(err?.message ?? "Get relationships failed");
   }
 }
+
 /* ---------- Sheets -> Mindbody: find-or-create from Paid Leads row ---------- */
+
 async function handleSheetsCreate(req: Request, payload: any) {
   const auth = verifySheetsSecret(req);
   if (!auth.ok) return unauthorized(auth.reason!);
@@ -1018,6 +1235,18 @@ async function handleSheetsCreate(req: Request, payload: any) {
   const seed = `${payload?.sheetId}:${payload?.rowNumber}:${firstName}:${lastName}`;
   const email = emailIsReal ? rawEmail : makeDummyEmail(seed);
   const phone = phoneIsReal ? phoneDigitsRaw : digitsOnly(makeDummyPhone(seed));
+
+  // Ledger identity key (real identifiers only). Used to catch just-created
+  // clients that Mindbody's search index hasn't surfaced yet.
+  const ledgerKey: LedgerKey = {
+    emailIsReal,
+    phoneIsReal,
+    emailNorm: emailIsReal ? normalizeEmail(rawEmail) : null,
+    phoneTail: phoneIsReal ? phoneDigitsRaw.slice(-10) : null,
+    firstName,
+    lastName
+  };
+
   console.log("sheets create request", {
     siteKey: payload?.siteKey ?? null,
     siteId,
@@ -1033,7 +1262,41 @@ async function handleSheetsCreate(req: Request, payload: any) {
     referralType: lead?.referralType ?? null,
     salesRep: lead?.salesRep ?? null
   });
+
+  // Best-effort: make sure the ledger table exists (no-op after first warm call).
   try {
+    await ensureLedgerTable();
+  } catch (e: any) {
+    console.log("ensureLedgerTable failed (continuing without ledger)", { message: e?.message });
+  }
+
+  try {
+    // 0. LEDGER FIRST — immune to Mindbody search-index lag. If we've already
+    //    resolved this identity, reuse it and record this row's alias so future
+    //    rows with a different email/phone converge on the same client.
+    const ledgerHit = await ledgerFindSafe(siteId, ledgerKey);
+    if (ledgerHit) {
+      await ledgerRecordSafe(siteId, ledgerKey, ledgerHit.id);
+      console.log("sheets create resolved via ledger", {
+        siteId,
+        via: ledgerHit.via,
+        mbClientId: ledgerHit.id,
+        rowNumber: payload?.rowNumber
+      });
+      return NextResponse.json({
+        ok: true,
+        status: "exists",
+        matchedVia: ledgerHit.via,
+        mbClientId: ledgerHit.id,
+        siteId,
+        fallbacksUsed: {
+          emailWasFallback: !emailIsReal,
+          phoneWasFallback: !phoneIsReal
+        }
+      });
+    }
+
+    // 1. Strict Mindbody search (verified email / phone+name).
     const found = await findClientForCreate(siteId, {
       firstName,
       lastName,
@@ -1055,6 +1318,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
       });
     }
     if (found.kind === "match") {
+      await ledgerRecordSafe(siteId, ledgerKey, found.id);
       return NextResponse.json({
         ok: true,
         status: "exists",
@@ -1067,6 +1331,8 @@ async function handleSheetsCreate(req: Request, payload: any) {
         }
       });
     }
+
+    // 2. Create, then record in the ledger so the very next row can find it.
     const created = await createClient(siteId, {
       firstName,
       lastName,
@@ -1074,6 +1340,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
       phone
     });
     if (!created?.Id) return serverError("Mindbody create failed");
+    await ledgerRecordSafe(siteId, ledgerKey, String(created.Id));
     return NextResponse.json({
       ok: true,
       status: "created",
@@ -1099,7 +1366,9 @@ async function handleSheetsCreate(req: Request, payload: any) {
     );
   }
 }
+
 /* ---------- Typeform handler ---------- */
+
 async function handleTypeform(req: Request, rawBody: string) {
   const verification = await verifyTypeform(req, rawBody);
   console.log("verification result:", verification);
@@ -1214,7 +1483,7 @@ async function handleTypeform(req: Request, rawBody: string) {
     // NOTE (2026-06-16): This path still uses the loose findClient() and shares
     // the same latent mismatch risk fixed on the Sheets create path. Left as-is
     // for now to avoid changing live Typeform dedup behavior; migrate it to
-    // findClientForCreate() when ready.
+    // findClientForCreate() (and the ledger) when ready.
     const existing = await findClient(siteId, {
       firstName: lead.firstName,
       lastName: lead.lastName,
@@ -1272,7 +1541,9 @@ async function handleTypeform(req: Request, rawBody: string) {
     );
   }
 }
+
 /* ---------- POST entrypoint ---------- */
+
 export async function POST(req: Request) {
   try {
     console.log("🔥 webhook hit");
