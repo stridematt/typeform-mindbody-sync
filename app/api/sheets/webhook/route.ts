@@ -198,8 +198,40 @@ function normalize(s: string) {
     .replace(/&/g, "and");
 }
 
-function normalizeEmail(s: string) {
-  return String(s || "").trim().toLowerCase();
+/**
+ * Canonical dedup key for an email (added 2026-07-16). Lowercase + trim, fix a
+ * few common typo domains, strip +aliases for everyone, and strip dots for Gmail
+ * (Gmail ignores both), so "John.Smith+gym@gmail.com", "johnsmith@gmail.com" and
+ * "johnsmith@googlemail.com" all map to ONE key. Used ONLY as the ledger match
+ * key — the real address the person typed is still what we send to Mindbody.
+ */
+function canonicalizeEmail(raw: string): string {
+  const e = String(raw || "").trim().toLowerCase();
+  const at = e.lastIndexOf("@");
+  if (at <= 0) return e; // no local part or no domain -> nothing to canonicalize
+  let local = e.slice(0, at);
+  let domain = e.slice(at + 1);
+
+  // Common typo domains -> canonical. Extend as you spot more.
+  const domainFix: Record<string, string> = {
+    "gmial.com": "gmail.com",
+    "gmai.com": "gmail.com",
+    "gmail.co": "gmail.com",
+    "gnail.com": "gmail.com",
+    "googlemail.com": "gmail.com",
+    "hotmial.com": "hotmail.com",
+    "hotmai.com": "hotmail.com",
+    "yahoo.co": "yahoo.com",
+    "outlook.co": "outlook.com"
+  };
+  if (domainFix[domain]) domain = domainFix[domain];
+
+  // +alias is widely supported -> drop it for everyone.
+  local = local.split("+")[0];
+  // Gmail ignores dots in the local part.
+  if (domain === "gmail.com") local = local.replace(/\./g, "");
+
+  return `${local}@${domain}`;
 }
 
 function slugifyStudioName(s: string) {
@@ -258,7 +290,13 @@ function isFallbackPhone(digits: string) {
  * real first and last name; last names must be equal; first names must be equal
  * or a clean prefix of one another. Junk like "X" will not agree with a real
  * surname, which is exactly what we want.
+ *
+ * RETAINED (2026-07-16): currently unused. The "one phone -> one client" policy
+ * removed the name gate from phone matching. Kept so you can re-enable name
+ * agreement on the phone path if you ever want shared-phone household members to
+ * stay separate. eslint-disable keeps CI happy while it's unreferenced.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function namesAgree(
   leadFirst: string,
   leadLast: string,
@@ -335,16 +373,26 @@ async function ensureLedgerTable() {
   ledgerReady = true;
 }
 
+type LedgerHit = {
+  id: string;
+  via: "ledger_email" | "ledger_phone";
+  // Set when the lead's email and phone point at DIFFERENT existing clients —
+  // i.e. two records that are probably the same person and should be merged.
+  // We prefer the email client but surface both ids so it can be flagged.
+  conflict?: { emailId: string; phoneId: string };
+};
+
 /**
  * Look up a prior-resolved client for this identity.
- *   1. Real-email exact match (unique per site) -> reuse.
- *   2. Phone-tail match, gated on name agreement, single distinct client -> reuse.
- * Returns null on no match or on any ambiguity (multiple distinct ids).
+ *   - Real-email exact match (unique per site).
+ *   - Phone-tail match: one phone -> one client, earliest recorded is canonical.
+ * If email and phone resolve to different clients, returns the email client with
+ * a `conflict` payload. Returns null on no match.
  */
-async function ledgerFind(
-  siteId: number,
-  k: LedgerKey
-): Promise<{ id: string; via: "ledger_email" | "ledger_phone" } | null> {
+async function ledgerFind(siteId: number, k: LedgerKey): Promise<LedgerHit | null> {
+  let emailId: string | null = null;
+  let phoneId: string | null = null;
+
   if (k.emailIsReal && k.emailNorm) {
     const r = await sql`
       select mb_client_id from sheets_client_ledger
@@ -352,22 +400,28 @@ async function ledgerFind(
       limit 1
     `;
     const row = (r as any[])[0];
-    if (row) return { id: String(row.mb_client_id), via: "ledger_email" };
+    if (row) emailId = String(row.mb_client_id);
   }
 
   if (k.phoneIsReal && k.phoneTail) {
+    // POLICY (2026-07-16): one phone number maps to exactly one client. Reused
+    // regardless of name; if dupes already exist for a phone, the earliest-
+    // recorded client is canonical. This intentionally MERGES anyone sharing a
+    // phone number (household members, a kid on a parent's line) onto one client.
     const rows = await sql`
-      select mb_client_id, first_norm, last_norm from sheets_client_ledger
+      select mb_client_id from sheets_client_ledger
       where site_id = ${siteId} and phone_tail = ${k.phoneTail}
+      order by created_at asc
     `;
-    const agree = (rows as any[]).filter((x) =>
-      namesAgree(k.firstName, k.lastName, String(x.first_norm || ""), String(x.last_norm || ""))
-    );
-    const ids = Array.from(new Set(agree.map((x) => String(x.mb_client_id))));
-    if (ids.length === 1) return { id: ids[0], via: "ledger_phone" };
-    // 0, or >1 distinct clients on a shared number -> don't guess.
+    const ids = Array.from(new Set((rows as any[]).map((x) => String(x.mb_client_id))));
+    if (ids.length >= 1) phoneId = ids[0];
   }
 
+  if (emailId && phoneId && emailId !== phoneId) {
+    return { id: emailId, via: "ledger_email", conflict: { emailId, phoneId } };
+  }
+  if (emailId) return { id: emailId, via: "ledger_email" };
+  if (phoneId) return { id: phoneId, via: "ledger_phone" };
   return null;
 }
 
@@ -427,6 +481,118 @@ async function ledgerRecordSafe(siteId: number, k: LedgerKey, mbClientId: string
   } catch (e: any) {
     console.log("ledgerRecord error (non-fatal)", { message: e?.message });
   }
+}
+
+/* ---------- Race guard: identity claims (added 2026-07-16) ----------
+   Before creating a client, a request "claims" each real identifier in a tiny
+   claims table (unique primary key). Two simultaneous submissions of the same
+   person contend on the same claim; the loser waits for the winner to record the
+   client, then reuses it (or defers so the sheet retries) — so they can never
+   both create. Fail-open: any DB error treats the claim as won, so this never
+   blocks a signup on a DB hiccup. A crashed winner's claim expires after
+   CLAIM_STALE_SECONDS so nothing is blocked permanently. */
+
+const CLAIM_STALE_SECONDS = 60;
+
+let claimsReady = false;
+async function ensureClaimsTable() {
+  if (claimsReady) return;
+  await sql`
+    create table if not exists sheets_dedup_claims (
+      site_id    integer not null,
+      claim_key  text not null,
+      created_at timestamptz default now(),
+      primary key (site_id, claim_key)
+    )
+  `;
+  claimsReady = true;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Sorted claim keys for a lead (real identifiers only). Sorted so racers contend
+// on the same key first — deterministic, no livelock.
+function claimKeysFor(k: LedgerKey): string[] {
+  const keys: string[] = [];
+  if (k.emailIsReal && k.emailNorm) keys.push(`email:${k.emailNorm}`);
+  if (k.phoneIsReal && k.phoneTail) keys.push(`phone:${k.phoneTail}`);
+  return keys.sort();
+}
+
+/**
+ * Claim every key. If any is already held by another in-flight request, release
+ * whatever we took and report won:false (caller should wait/defer).
+ */
+async function claimIdentities(
+  siteId: number,
+  keys: string[]
+): Promise<{ won: boolean; acquired: string[] }> {
+  const acquired: string[] = [];
+  for (const key of keys) {
+    // Let a stale claim (crashed claimer) be retaken.
+    await sql`
+      delete from sheets_dedup_claims
+      where site_id = ${siteId} and claim_key = ${key}
+        and created_at < now() - make_interval(secs => ${CLAIM_STALE_SECONDS})
+    `;
+    const r = await sql`
+      insert into sheets_dedup_claims (site_id, claim_key)
+      values (${siteId}, ${key})
+      on conflict do nothing
+      returning site_id
+    `;
+    if ((r as any[]).length) {
+      acquired.push(key);
+    } else {
+      for (const a of acquired) {
+        await sql`delete from sheets_dedup_claims where site_id = ${siteId} and claim_key = ${a}`;
+      }
+      return { won: false, acquired: [] };
+    }
+  }
+  return { won: true, acquired };
+}
+
+async function releaseClaims(siteId: number, keys: string[]) {
+  for (const key of keys) {
+    await sql`delete from sheets_dedup_claims where site_id = ${siteId} and claim_key = ${key}`;
+  }
+}
+
+async function claimIdentitiesSafe(siteId: number, keys: string[]) {
+  if (!keys.length) return { won: true, acquired: [] as string[] };
+  try {
+    return await claimIdentities(siteId, keys);
+  } catch (e: any) {
+    console.log("claimIdentities error (failing open, no race guard)", { message: e?.message });
+    return { won: true, acquired: [] as string[] };
+  }
+}
+
+async function releaseClaimsSafe(siteId: number, keys: string[]) {
+  if (!keys.length) return;
+  try {
+    await releaseClaims(siteId, keys);
+  } catch (e: any) {
+    console.log("releaseClaims error (non-fatal)", { message: e?.message });
+  }
+}
+
+// Poll the ledger briefly, waiting for a concurrent winner to record the client.
+async function waitForLedgerId(
+  siteId: number,
+  k: LedgerKey,
+  tries: number,
+  delayMs: number
+): Promise<string | null> {
+  for (let i = 0; i < tries; i++) {
+    const hit = await ledgerFindSafe(siteId, k);
+    if (hit) return hit.id;
+    await sleep(delayMs);
+  }
+  return null;
 }
 
 /* ---------- Typeform payload extraction ---------- */
@@ -807,7 +973,10 @@ async function findClientForCreate(
       if (exact.length > 1) return { kind: "ambiguous", via: "email", count: exact.length };
     }
   }
-  // 2. Verified phone match, gated on name agreement.
+  // 2. Verified phone match. POLICY (2026-07-16): one phone -> one client, so a
+  // verified phone match is reused regardless of name (no name-agreement gate).
+  // This also catches a client that already exists in Mindbody (from before the
+  // ledger) so we don't create a second one for the same number.
   if (args.phoneIsReal && args.phone) {
     const res = await mindbodyGetClientsBySearch(siteId, args.phone.slice(-10));
     if (res.ok) {
@@ -816,23 +985,13 @@ async function findClientForCreate(
         const cand = [c?.MobilePhone, c?.HomePhone, c?.WorkPhone].filter(Boolean);
         return cand.some((p: string) => phonesMatch(p, args.phone));
       });
-      const nameMatches = phoneMatches.filter((c) =>
-        namesAgree(
-          args.firstName,
-          args.lastName,
-          String(c?.FirstName || ""),
-          String(c?.LastName || "")
-        )
-      );
       console.log("findClientForCreate phone pass", {
         phoneTail: args.phone.slice(-10),
         returned: clients.length,
-        phoneMatches: phoneMatches.length,
-        nameMatches: nameMatches.length
+        phoneMatches: phoneMatches.length
       });
-      if (nameMatches.length === 1) return { kind: "match", id: String(nameMatches[0].Id), via: "phone" };
-      if (nameMatches.length > 1) return { kind: "ambiguous", via: "phone", count: nameMatches.length };
-      // phone matched but no name agreement -> treat as a new person.
+      if (phoneMatches.length === 1) return { kind: "match", id: String(phoneMatches[0].Id), via: "phone" };
+      if (phoneMatches.length > 1) return { kind: "ambiguous", via: "phone", count: phoneMatches.length };
     }
   }
   return { kind: "none" };
@@ -1241,7 +1400,7 @@ async function handleSheetsCreate(req: Request, payload: any) {
   const ledgerKey: LedgerKey = {
     emailIsReal,
     phoneIsReal,
-    emailNorm: emailIsReal ? normalizeEmail(rawEmail) : null,
+    emailNorm: emailIsReal ? canonicalizeEmail(rawEmail) : null,
     phoneTail: phoneIsReal ? phoneDigitsRaw.slice(-10) : null,
     firstName,
     lastName
@@ -1263,12 +1422,24 @@ async function handleSheetsCreate(req: Request, payload: any) {
     salesRep: lead?.salesRep ?? null
   });
 
-  // Best-effort: make sure the ledger table exists (no-op after first warm call).
+  // Best-effort: make sure the ledger + claims tables exist (no-op after first
+  // warm call). Manual creation in Neon is preferred; these are safety nets.
   try {
     await ensureLedgerTable();
   } catch (e: any) {
     console.log("ensureLedgerTable failed (continuing without ledger)", { message: e?.message });
   }
+  try {
+    await ensureClaimsTable();
+  } catch (e: any) {
+    console.log("ensureClaimsTable failed (continuing without race guard)", { message: e?.message });
+  }
+
+  const fallbacksUsed = {
+    emailWasFallback: !emailIsReal,
+    phoneWasFallback: !phoneIsReal
+  };
+  const claimKeys = claimKeysFor(ledgerKey);
 
   try {
     // 0. LEDGER FIRST — immune to Mindbody search-index lag. If we've already
@@ -1277,6 +1448,15 @@ async function handleSheetsCreate(req: Request, payload: any) {
     const ledgerHit = await ledgerFindSafe(siteId, ledgerKey);
     if (ledgerHit) {
       await ledgerRecordSafe(siteId, ledgerKey, ledgerHit.id);
+      if (ledgerHit.conflict) {
+        console.log("DEDUP CONFLICT: email and phone map to different clients", {
+          siteId,
+          rowNumber: payload?.rowNumber,
+          emailClient: ledgerHit.conflict.emailId,
+          phoneClient: ledgerHit.conflict.phoneId,
+          usingClient: ledgerHit.id
+        });
+      }
       console.log("sheets create resolved via ledger", {
         siteId,
         via: ledgerHit.via,
@@ -1289,68 +1469,97 @@ async function handleSheetsCreate(req: Request, payload: any) {
         matchedVia: ledgerHit.via,
         mbClientId: ledgerHit.id,
         siteId,
-        fallbacksUsed: {
-          emailWasFallback: !emailIsReal,
-          phoneWasFallback: !phoneIsReal
-        }
+        ...(ledgerHit.conflict ? { conflict: ledgerHit.conflict } : {}),
+        fallbacksUsed
       });
     }
 
-    // 1. Strict Mindbody search (verified email / phone+name).
-    const found = await findClientForCreate(siteId, {
-      firstName,
-      lastName,
-      email,
-      phone,
-      emailIsReal,
-      phoneIsReal
-    });
-    if (found.kind === "ambiguous") {
-      // Don't guess. Surface it so the row gets human review instead of being
-      // silently attached to the wrong person.
-      return NextResponse.json({
-        ok: true,
-        status: "ambiguous",
-        via: found.via,
-        count: found.count,
-        siteId,
-        message: `Multiple Mindbody clients matched on ${found.via}; not auto-linking`
-      });
-    }
-    if (found.kind === "match") {
-      await ledgerRecordSafe(siteId, ledgerKey, found.id);
-      return NextResponse.json({
-        ok: true,
-        status: "exists",
-        matchedVia: found.via,
-        mbClientId: found.id,
-        siteId,
-        fallbacksUsed: {
-          emailWasFallback: !emailIsReal,
-          phoneWasFallback: !phoneIsReal
-        }
-      });
-    }
-
-    // 2. Create, then record in the ledger so the very next row can find it.
-    const created = await createClient(siteId, {
-      firstName,
-      lastName,
-      email,
-      phone
-    });
-    if (!created?.Id) return serverError("Mindbody create failed");
-    await ledgerRecordSafe(siteId, ledgerKey, String(created.Id));
-    return NextResponse.json({
-      ok: true,
-      status: "created",
-      mbClientId: String(created.Id),
-      siteId,
-      fallbacksUsed: {
-        emailWasFallback: !emailIsReal,
-        phoneWasFallback: !phoneIsReal
+    // 0.5 RACE GUARD — claim this identity before creating so two simultaneous
+    //     submissions of the same person can't both create a client.
+    const claim = await claimIdentitiesSafe(siteId, claimKeys);
+    if (!claim.won) {
+      // Another request is creating this person right now. Wait briefly for it to
+      // record, then reuse. If it isn't ready in time, defer (no client id) so
+      // the sheet retries — we never create a duplicate.
+      const winnerId = await waitForLedgerId(siteId, ledgerKey, 6, 400); // ~2.4s
+      if (winnerId) {
+        await ledgerRecordSafe(siteId, ledgerKey, winnerId);
+        return NextResponse.json({
+          ok: true,
+          status: "exists",
+          matchedVia: "ledger_race",
+          mbClientId: winnerId,
+          siteId,
+          fallbacksUsed
+        });
       }
-    });
+      console.log("dedup claim lost; deferring create for retry", {
+        siteId,
+        rowNumber: payload?.rowNumber,
+        claimKeys
+      });
+      return NextResponse.json({
+        ok: true,
+        status: "deferred",
+        reason: "another create for this identity is in progress; resolves on retry",
+        siteId
+      });
+    }
+
+    try {
+      // 1. Strict Mindbody search (verified email / phone).
+      const found = await findClientForCreate(siteId, {
+        firstName,
+        lastName,
+        email,
+        phone,
+        emailIsReal,
+        phoneIsReal
+      });
+      if (found.kind === "ambiguous") {
+        // Don't guess. Surface it so the row gets human review instead of being
+        // silently attached to the wrong person.
+        return NextResponse.json({
+          ok: true,
+          status: "ambiguous",
+          via: found.via,
+          count: found.count,
+          siteId,
+          message: `Multiple Mindbody clients matched on ${found.via}; not auto-linking`
+        });
+      }
+      if (found.kind === "match") {
+        await ledgerRecordSafe(siteId, ledgerKey, found.id);
+        return NextResponse.json({
+          ok: true,
+          status: "exists",
+          matchedVia: found.via,
+          mbClientId: found.id,
+          siteId,
+          fallbacksUsed
+        });
+      }
+
+      // 2. Create, then record in the ledger so the very next row can find it.
+      const created = await createClient(siteId, {
+        firstName,
+        lastName,
+        email,
+        phone
+      });
+      if (!created?.Id) return serverError("Mindbody create failed");
+      await ledgerRecordSafe(siteId, ledgerKey, String(created.Id));
+      return NextResponse.json({
+        ok: true,
+        status: "created",
+        mbClientId: String(created.Id),
+        siteId,
+        fallbacksUsed
+      });
+    } finally {
+      // Always release our claims so retries/other people aren't blocked.
+      await releaseClaimsSafe(siteId, claimKeys);
+    }
   } catch (err: any) {
     const status = err?.response?.status ?? null;
     const data = err?.response?.data ?? null;
