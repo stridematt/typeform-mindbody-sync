@@ -1565,12 +1565,20 @@ async function handleSheetsCreate(req: Request, payload: any) {
       }
 
       // 2. Create, then record in the ledger so the very next row can find it.
-      const created = await createClient(siteId, {
-        firstName,
-        lastName,
-        email,
-        phone
-      });
+      //    (2026-10-02) Referred By is set IN the AddClient call so attribution
+      //    lands even if Mindbody later reassigns the Client ID and a follow-up
+      //    UpdateClient by the original Id fails.
+      const referralTypeAtCreate = String(lead?.referralType || "").trim() || undefined;
+      const created = await createClient(
+        siteId,
+        {
+          firstName,
+          lastName,
+          email,
+          phone
+        },
+        referralTypeAtCreate ? { referredBy: referralTypeAtCreate } : undefined
+      );
       if (!created?.Id) return serverError("Mindbody create failed");
       await ledgerRecordSafe(siteId, ledgerKey, String(created.Id));
       return NextResponse.json({
