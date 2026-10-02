@@ -49,6 +49,20 @@ export const runtime = "nodejs";
  *   error degrades gracefully to the previous Mindbody-search behavior.
  *   Run outputs/sheets_client_ledger.sql once in Neon (see steps in chat), or
  *   let ensureLedgerTable() create it on first request.
+ *
+ * CHANGE LOG (2026-10-02): GHL -> Mindbody create/update (handleGhl).
+ *   GoHighLevel's Webhook action sends flat key/value JSON and cannot build the
+ *   nested { lead: {...} } shape the Sheets create path expects. handleGhl
+ *   accepts a flat payload ({ ghl: true, siteKey, ghlContactId, mbClientId?,
+ *   firstName, lastName, email, phone, referredBy }) and decides:
+ *     - mbClientId empty  -> find-or-create via handleSheetsCreate (ledger,
+ *                            race guard, strict match), then sets Referred By.
+ *     - mbClientId present -> update name / email / phone on that client.
+ *   Referred By protection applies on both paths. Updates also record the new
+ *   email/phone in the ledger so later rows from any source converge on the
+ *   same client. mindbodyUpdateClient gained Email + MobilePhone support.
+ *   Response always carries mbClientId at the top level for GHL response
+ *   mapping into the "Mindbody ID" custom field.
  */
 
 const sql = neon(
@@ -846,21 +860,29 @@ async function mindbodyGetClientsBySearch(siteId: number, searchText: string) {
   });
 }
 
+/**
+ * UpdateClient wrapper. (2026-10-02) Gained email + phone so the GHL update path
+ * can carry contact-info changes, not just Referred By / sales rep.
+ */
 async function mindbodyUpdateClient(
   siteId: number,
   client: {
     mbClientId: string;
     firstName?: string;
     lastName?: string;
+    email?: string;
+    phone?: string; // digits only
     referredBy?: string;
     salesRep?: string | number;
   }
 ) {
   const clientBody: any = { Id: client.mbClientId };
   // FirstName / LastName are required by Mindbody's UpdateClient request body
-  // even when they aren't changing. We pass them through from the sheet.
+  // even when they aren't changing. We pass them through from the caller.
   if (client.firstName) clientBody.FirstName = client.firstName;
   if (client.lastName) clientBody.LastName = client.lastName;
+  if (client.email) clientBody.Email = client.email;
+  if (client.phone) clientBody.MobilePhone = client.phone;
   if (client.referredBy) clientBody.ReferredBy = client.referredBy;
   if (client.salesRep) {
     const repId = Number(client.salesRep);
@@ -1576,6 +1598,214 @@ async function handleSheetsCreate(req: Request, payload: any) {
   }
 }
 
+/* ---------- GHL -> Mindbody: flat-payload create / update (added 2026-10-02) ----------
+   GoHighLevel's Webhook action sends flat key/value JSON. One payload shape for
+   both directions:
+
+     {
+       ghl: true,
+       siteKey: "HB",
+       ghlContactId: "...",    // GHL contact id, for logs
+       mbClientId: "",         // empty on first sync; set once GHL maps the response
+       firstName, lastName, email, phone,
+       referredBy: "Social Media Lead"
+     }
+
+   Decision:
+     mbClientId empty   -> find-or-create via handleSheetsCreate (ledger, race
+                           guard, strict match), then set Referred By.
+     mbClientId present -> update name / email / phone (Referred By protected).
+
+   Response always has mbClientId at the top level so GHL can map it into the
+   "Mindbody ID" custom field. Nameless or identifier-less leads return
+   status "deferred" with no side effects; GHL retries on the next change.   */
+
+async function handleGhl(req: Request, payload: any) {
+  const auth = verifySheetsSecret(req);
+  if (!auth.ok) return unauthorized(auth.reason!);
+  const site = resolveSiteId(payload?.siteKey);
+  if (!site.ok) return badRequest(site.reason);
+  const siteId = site.siteId;
+
+  const ghlContactId = String(payload?.ghlContactId || "").trim();
+  const mbClientIdIn = String(payload?.mbClientId || "").trim();
+  const firstName = String(payload?.firstName || "").trim();
+  const lastName = String(payload?.lastName || "").trim();
+  const rawEmail = String(payload?.email || "").trim();
+  const rawPhone = String(payload?.phone || "").trim();
+  const phoneDigits = digitsOnly(rawPhone);
+  const referredBy = String(payload?.referredBy || "").trim();
+
+  const emailIsReal = rawEmail.includes("@") && !isFallbackEmail(rawEmail);
+  const phoneIsReal = phoneDigits.length >= 10 && !isFallbackPhone(phoneDigits);
+
+  console.log("ghl request", {
+    siteKey: payload?.siteKey ?? null,
+    siteId,
+    ghlContactId,
+    mode: mbClientIdIn ? "update" : "create",
+    mbClientId: mbClientIdIn || null,
+    firstName,
+    lastName,
+    emailIsReal,
+    phoneIsReal,
+    referredBy: referredBy || null
+  });
+
+  // Same protection rule as handleSheetsUpdateClient: never clobber a
+  // meaningful Referred By. Also returns Mindbody's current names so an
+  // email-only update can satisfy UpdateClient's FirstName/LastName requirement.
+  async function protectedReferredBy(
+    clientId: string
+  ): Promise<{ send: string | undefined; kept: string | null; names: { first: string; last: string } }> {
+    const info = await mindbodyGetClientCompleteInfo(siteId, clientId);
+    if (!info.ok) {
+      // Fail safe toward NOT overwriting.
+      return { send: undefined, kept: "unknown (read failed)", names: { first: "", last: "" } };
+    }
+    const c = info.data?.Client ?? info.data ?? {};
+    const current = String(c?.ReferredBy ?? "").trim();
+    const names = {
+      first: String(c?.FirstName || "").trim(),
+      last: String(c?.LastName || "").trim()
+    };
+    if (!referredBy) return { send: undefined, kept: null, names };
+    if (current && PROTECTED_REFERRAL_TYPES.has(current.toLowerCase())) {
+      return { send: undefined, kept: current, names };
+    }
+    return { send: referredBy, kept: null, names };
+  }
+
+  try {
+    /* ================= UPDATE: Mindbody ID already on the GHL contact ================= */
+    if (mbClientIdIn) {
+      const prot = await protectedReferredBy(mbClientIdIn);
+      // Prefer what GHL sent (the lead may have just given their real name);
+      // fall back to what Mindbody already has so an email-only change succeeds.
+      const sendFirst = firstName || prot.names.first;
+      const sendLast = lastName || prot.names.last;
+      if (!sendFirst || !sendLast) {
+        return badRequest("Cannot update: no first/last name available for UpdateClient");
+      }
+      const result = await mindbodyUpdateClient(siteId, {
+        mbClientId: mbClientIdIn,
+        firstName: sendFirst,
+        lastName: sendLast,
+        email: emailIsReal ? rawEmail : undefined,
+        phone: phoneIsReal ? phoneDigits : undefined,
+        referredBy: prot.send
+      });
+      console.log("ghl update result", {
+        status: result.status,
+        ok: result.ok,
+        bodySample: result.text?.slice(0, 300)
+      });
+      if (!result.ok) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: `Mindbody updateClient failed: ${result.status}`,
+            mindbody: result.data ?? result.text
+          },
+          { status: 502 }
+        );
+      }
+      // Keep the dedup ledger in step so a later create for this person (from
+      // any source) converges on the same client.
+      await ledgerRecordSafe(
+        siteId,
+        {
+          emailIsReal,
+          phoneIsReal,
+          emailNorm: emailIsReal ? canonicalizeEmail(rawEmail) : null,
+          phoneTail: phoneIsReal ? phoneDigits.slice(-10) : null,
+          firstName: sendFirst,
+          lastName: sendLast
+        },
+        mbClientIdIn
+      );
+      return NextResponse.json({
+        ok: true,
+        status: "updated",
+        mbClientId: mbClientIdIn,
+        siteId,
+        keptReferredBy: prot.kept
+      });
+    }
+
+    /* ================= CREATE: no Mindbody ID yet ================= */
+    if (!firstName || !lastName) {
+      // Same rule as the sheet: never create a nameless client. GHL retries on
+      // the next contact change once the lead has given a name.
+      return NextResponse.json({
+        ok: true,
+        status: "deferred",
+        reason: "missing firstName or lastName; will create once the lead provides a name",
+        siteId
+      });
+    }
+    if (!emailIsReal && !phoneIsReal) {
+      return NextResponse.json({
+        ok: true,
+        status: "deferred",
+        reason: "no real email or phone yet; nothing safe to match on",
+        siteId
+      });
+    }
+
+    // Reuse the hardened sheets create path (ledger, race guard, strict match).
+    const createRes = await handleSheetsCreate(req, {
+      sheetId: `ghl:${String(payload?.siteKey || "HB").toUpperCase()}`,
+      sheetName: "instagram",
+      rowNumber: ghlContactId || "n/a",
+      siteKey: payload?.siteKey,
+      backfill: true,
+      lead: {
+        firstName,
+        lastName,
+        email: emailIsReal ? rawEmail : undefined,
+        phone: phoneIsReal ? phoneDigits : undefined,
+        leadSource: "Instagram",
+        referralType: referredBy || undefined
+      }
+    });
+    const created: any = await createRes.json();
+    if (!created?.ok || !created?.mbClientId) {
+      // ambiguous / deferred / error: pass straight through so GHL sees it.
+      return NextResponse.json(created, { status: createRes.status });
+    }
+    const mbClientId = String(created.mbClientId);
+
+    // Set Referred By on the new/matched client (protected if already meaningful).
+    let keptReferredBy: string | null = null;
+    if (referredBy) {
+      const prot = await protectedReferredBy(mbClientId);
+      keptReferredBy = prot.kept;
+      if (prot.send) {
+        const upd = await mindbodyUpdateClient(siteId, {
+          mbClientId,
+          firstName,
+          lastName,
+          referredBy: prot.send
+        });
+        console.log("ghl set referredBy after create", { status: upd.status, ok: upd.ok });
+      }
+    }
+
+    return NextResponse.json({
+      ok: true,
+      status: created.status, // "created" | "exists"
+      matchedVia: created.matchedVia ?? null,
+      mbClientId,
+      siteId,
+      keptReferredBy
+    });
+  } catch (err: any) {
+    console.log("ghl handler error", { message: err?.message, stack: err?.stack });
+    return serverError(err?.message ?? "GHL sync failed");
+  }
+}
+
 /* ---------- Typeform handler ---------- */
 
 async function handleTypeform(req: Request, rawBody: string) {
@@ -1780,6 +2010,11 @@ export async function POST(req: Request) {
       earlyPayload = JSON.parse(rawBody);
     } catch {
       // Not JSON — let the Typeform path return the appropriate error below.
+    }
+    // GHL flat payload. Accepts boolean true or the string "true" because GHL's
+    // Custom Data serializes values as strings.
+    if (earlyPayload?.ghl === true || earlyPayload?.ghl === "true") {
+      return await handleGhl(req, earlyPayload);
     }
     if (earlyPayload?.lookupOnly === true) {
       return await handleSheetsLookup(req, earlyPayload);
