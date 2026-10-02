@@ -1637,14 +1637,21 @@ async function handleGhl(req: Request, payload: any) {
   if (!site.ok) return badRequest(site.reason);
   const siteId = site.siteId;
 
-  const ghlContactId = String(payload?.ghlContactId || "").trim();
-  const mbClientIdIn = String(payload?.mbClientId || "").trim();
-  const firstName = String(payload?.firstName || "").trim();
-  const lastName = String(payload?.lastName || "").trim();
-  const rawEmail = String(payload?.email || "").trim();
-  const rawPhone = String(payload?.phone || "").trim();
+  // GHL's Custom Webhook renders an EMPTY merge field as the literal string
+  // "null" (observed 2026-10-02: an empty Mindbody ID arrived as "null" and the
+  // handler tried to UpdateClient id "null"). Treat those placeholders as empty.
+  const ghlStr = (v: unknown): string => {
+    const s = String(v ?? "").trim();
+    return /^(null|undefined|nan)$/i.test(s) ? "" : s;
+  };
+  const ghlContactId = ghlStr(payload?.ghlContactId);
+  const mbClientIdIn = ghlStr(payload?.mbClientId);
+  const firstName = ghlStr(payload?.firstName);
+  const lastName = ghlStr(payload?.lastName);
+  const rawEmail = ghlStr(payload?.email);
+  const rawPhone = ghlStr(payload?.phone);
   const phoneDigits = digitsOnly(rawPhone);
-  const referredBy = String(payload?.referredBy || "").trim();
+  const referredBy = ghlStr(payload?.referredBy);
 
   const emailIsReal = rawEmail.includes("@") && !isFallbackEmail(rawEmail);
   const phoneIsReal = phoneDigits.length >= 10 && !isFallbackPhone(phoneDigits);
