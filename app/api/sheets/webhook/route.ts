@@ -4,6 +4,8 @@ import { neon } from "@neondatabase/serverless";
 import { findClient, createClient } from "../../../../lib/mindbody";
 
 export const runtime = "nodejs";
+// Create path can wait a few seconds for Mindbody search to index a new client.
+export const maxDuration = 30;
 
 /*
  * CHANGE LOG (2026-06-16):
@@ -1679,7 +1681,36 @@ async function handleGhl(req: Request, payload: any) {
   try {
     /* ================= UPDATE: Mindbody ID already on the GHL contact ================= */
     if (mbClientIdIn) {
-      const prot = await protectedReferredBy(mbClientIdIn);
+      // Mindbody can REASSIGN the Client ID shortly after creation (HB assigns a
+      // barcode-style Client ID; AddClient returns the internal record number).
+      // So the ID GHL holds may be stale. Resolve the current ID first by
+      // searching on the identifiers we have; fall back to the stored ID.
+      let mbClientId = mbClientIdIn;
+      let idCorrected = false;
+      const searchable = (emailIsReal && rawEmail) || (phoneIsReal && phoneDigits);
+      if (searchable) {
+        const found = await findClientForCreate(siteId, {
+          firstName,
+          lastName,
+          email: emailIsReal ? rawEmail : "",
+          phone: phoneIsReal ? phoneDigits : "",
+          emailIsReal,
+          phoneIsReal
+        });
+        if (found.kind === "match" && found.id !== mbClientIdIn) {
+          console.log("ghl update: stored Mindbody ID is stale, using search result", {
+            siteId,
+            ghlContactId,
+            storedId: mbClientIdIn,
+            resolvedId: found.id,
+            via: found.via
+          });
+          mbClientId = found.id;
+          idCorrected = true;
+        }
+      }
+
+      const prot = await protectedReferredBy(mbClientId);
       // Prefer what GHL sent (the lead may have just given their real name);
       // fall back to what Mindbody already has so an email-only change succeeds.
       const sendFirst = firstName || prot.names.first;
@@ -1688,7 +1719,7 @@ async function handleGhl(req: Request, payload: any) {
         return badRequest("Cannot update: no first/last name available for UpdateClient");
       }
       const result = await mindbodyUpdateClient(siteId, {
-        mbClientId: mbClientIdIn,
+        mbClientId,
         firstName: sendFirst,
         lastName: sendLast,
         email: emailIsReal ? rawEmail : undefined,
@@ -1698,6 +1729,7 @@ async function handleGhl(req: Request, payload: any) {
       console.log("ghl update result", {
         status: result.status,
         ok: result.ok,
+        idCorrected,
         bodySample: result.text?.slice(0, 300)
       });
       if (!result.ok) {
@@ -1705,10 +1737,24 @@ async function handleGhl(req: Request, payload: any) {
           {
             ok: false,
             error: `Mindbody updateClient failed: ${result.status}`,
-            mindbody: result.data ?? result.text
+            mindbody: result.data ?? result.text,
+            mbClientId
           },
           { status: 502 }
         );
+      }
+      // If the stored ID was stale, repoint any ledger rows that carry it so
+      // future creates/updates for this person converge on the real client.
+      if (idCorrected) {
+        try {
+          await sql`
+            update sheets_client_ledger
+            set mb_client_id = ${mbClientId}
+            where site_id = ${siteId} and mb_client_id = ${mbClientIdIn}
+          `;
+        } catch (e: any) {
+          console.log("ledger repoint failed (non-fatal)", { message: e?.message });
+        }
       }
       // Keep the dedup ledger in step so a later create for this person (from
       // any source) converges on the same client.
@@ -1722,12 +1768,15 @@ async function handleGhl(req: Request, payload: any) {
           firstName: sendFirst,
           lastName: sendLast
         },
-        mbClientIdIn
+        mbClientId
       );
+      // mbClientId here may differ from what GHL sent; GHL's response mapping
+      // writes it back to the contact, so the stale value self-corrects.
       return NextResponse.json({
         ok: true,
         status: "updated",
-        mbClientId: mbClientIdIn,
+        mbClientId,
+        idCorrected,
         siteId,
         keptReferredBy: prot.kept
       });
