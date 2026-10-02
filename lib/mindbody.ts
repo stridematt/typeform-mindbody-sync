@@ -28,6 +28,19 @@ const BASE_URL = "https://api.mindbodyonline.com/public/v6";
  *     - createClient now stores the phone in canonical last-10 form.
  *     - addContactLog no longer violates Mindbody's rule that FollowupByDate and
  *       AssignedTo must be both-present or both-absent, and defaults ContactMethod.
+ *
+ * CHANGE LOG (2026-10-02) — createClient returns a VERIFIED client Id
+ *
+ *   AddClient returned Id "100002851" for a new HB client, but UpdateClient with
+ *   that Id failed "Client with Custom ID 100002851 does not exist", and a phone
+ *   search a minute later returned the same person as Id "1790969766". The Id
+ *   in the AddClient response is not reliably the addressable Client ID.
+ *
+ *   createClient now verifies the returned Id with clientcompleteinfo and, if
+ *   that fails, resolves the real Id by searching on the identifiers it just
+ *   wrote (short retry for index lag). It also logs the raw Id/UniqueId pair
+ *   from the AddClient response so the relationship is visible per site.
+ *   Callers are unchanged: they still read `.Id` off the returned object.
  */
 
 function requireEnv(name: string) {
@@ -156,6 +169,10 @@ function namesAgree(leadFirst: string, leadLast: string, clientFirst: string, cl
   if (canonFirstName(leadFirst) === canonFirstName(clientFirst)) return true;
   if ((lf.length === 1 || cf.length === 1) && lf[0] === cf[0]) return true;
   return false;
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /* ---------- Auth ---------- */
@@ -294,6 +311,64 @@ export async function findClient(
   return null;
 }
 
+/* ---------- Created-client Id verification (added 2026-10-02) ---------- */
+
+/** True if Mindbody can address this client Id (clientcompleteinfo 200). */
+async function clientIdExists(client: any, id: string): Promise<boolean> {
+  try {
+    const res = await client.get(`/client/clientcompleteinfo`, {
+      params: { ClientId: id },
+    });
+    const c = res.data?.Client ?? res.data;
+    return !!(c && (c.Id || c.UniqueId));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Find the addressable Client ID for a client we just created, by searching on
+ * its real email or phone. Mindbody's search index is eventually consistent,
+ * so retry a few times. Returns null if nothing verifies.
+ */
+async function resolveCreatedClientId(
+  client: any,
+  input: { firstName: string; lastName: string; email?: string; phone?: string },
+  tries = 4,
+  delayMs = 750
+): Promise<string | null> {
+  const emailLower = (input.email ?? "").trim().toLowerCase();
+  const emailIsReal = emailLower.includes("@") && !isFallbackEmail(emailLower);
+  const phoneCanon = last10(input.phone);
+  const phoneIsReal = phoneCanon.length === 10 && !isFallbackPhone(phoneCanon);
+
+  for (let i = 0; i < tries; i++) {
+    if (emailIsReal) {
+      const rows = await searchClients(client, emailLower);
+      const exact = rows.filter(
+        (c) => String(c?.Email || "").trim().toLowerCase() === emailLower
+      );
+      if (exact.length === 1 && exact[0]?.Id) return String(exact[0].Id);
+    }
+    if (phoneIsReal) {
+      const rows = await searchClients(client, phoneCanon);
+      const phoneMatches = rows.filter((c) =>
+        [c?.MobilePhone, c?.HomePhone, c?.WorkPhone]
+          .filter(Boolean)
+          .some((p: string) => phonesMatch(p, phoneCanon))
+      );
+      // Prefer the one whose name matches what we just wrote.
+      const named = phoneMatches.filter((c) =>
+        namesAgree(input.firstName, input.lastName, String(c?.FirstName || ""), String(c?.LastName || ""))
+      );
+      const pick = named.length >= 1 ? named[0] : phoneMatches.length === 1 ? phoneMatches[0] : null;
+      if (pick?.Id) return String(pick.Id);
+    }
+    if (i < tries - 1) await sleep(delayMs);
+  }
+  return null;
+}
+
 /**
  * Create a prospect client in Mindbody.
  * Optional:
@@ -313,6 +388,10 @@ export async function findClient(
  * Referral Type configured on the site (Manager Tools > Referral Types). If you
  * send a value that doesn't exist as a referral type, some sites may drop it.
  * Make sure your affiliate/coach names exist as referral types on each site.
+ *
+ * (2026-10-02) The returned object's `.Id` is now VERIFIED: it is confirmed via
+ * clientcompleteinfo, or resolved by search if Mindbody's AddClient response
+ * handed back a non-addressable Id. See the change log at the top of the file.
  */
 export async function createClient(
   siteId: number,
@@ -360,8 +439,42 @@ export async function createClient(
   ) {
     payload.LeadChannelId = Number(options.leadChannelId);
   }
+
   const res = await client.post(`/client/addclient`, payload);
-  return res.data?.Client ?? null;
+  const created = res.data?.Client ?? null;
+  if (!created) return null;
+
+  // Diagnostic: capture what Mindbody actually returned so the Id/UniqueId
+  // relationship is visible in logs for this site.
+  console.log("mindbody addclient response ids", {
+    siteId,
+    Id: created?.Id ?? null,
+    UniqueId: created?.UniqueId ?? null,
+  });
+
+  // Verify the returned Id is addressable. If not, resolve the real one.
+  const returnedId = created?.Id != null ? String(created.Id) : "";
+  if (returnedId && (await clientIdExists(client, returnedId))) {
+    return { ...created, Id: returnedId };
+  }
+
+  const resolved = await resolveCreatedClientId(client, input);
+  if (resolved) {
+    console.log("mindbody addclient Id corrected via search", {
+      siteId,
+      returnedId: returnedId || null,
+      resolvedId: resolved,
+    });
+    return { ...created, Id: resolved };
+  }
+
+  // Could not verify or resolve. Return what we have so the caller still gets a
+  // response, but flag it loudly — this Id may not be usable for updates.
+  console.log("mindbody addclient Id UNVERIFIED (updates may fail)", {
+    siteId,
+    returnedId: returnedId || null,
+  });
+  return created;
 }
 
 /**
