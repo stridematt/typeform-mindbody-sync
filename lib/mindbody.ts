@@ -313,16 +313,23 @@ export async function findClient(
 
 /* ---------- Created-client Id verification (added 2026-10-02) ---------- */
 
-/** True if Mindbody can address this client Id (clientcompleteinfo 200). */
-async function clientIdExists(client: any, id: string): Promise<boolean> {
+/**
+ * Ask Mindbody for the client by the Id AddClient gave us and return the Id
+ * Mindbody itself reports on that record. clientcompleteinfo accepts more than
+ * one identifier (it resolved a UniqueId-style number that UpdateClient then
+ * rejected), so existence alone proves nothing. The Id on the returned Client
+ * object is the addressable one. Returns null if the lookup fails.
+ */
+async function reportedClientId(client: any, id: string): Promise<string | null> {
   try {
     const res = await client.get(`/client/clientcompleteinfo`, {
       params: { ClientId: id },
     });
     const c = res.data?.Client ?? res.data;
-    return !!(c && (c.Id || c.UniqueId));
+    const reported = c?.Id != null ? String(c.Id).trim() : "";
+    return reported || null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -452,24 +459,41 @@ export async function createClient(
     UniqueId: created?.UniqueId ?? null,
   });
 
-  // Verify the returned Id is addressable. If not, resolve the real one.
   const returnedId = created?.Id != null ? String(created.Id) : "";
-  if (returnedId && (await clientIdExists(client, returnedId))) {
-    return { ...created, Id: returnedId };
+
+  // 1. Search is the source of truth: the Id it reports is the one UpdateClient
+  //    accepts. Retry briefly for index lag (3 tries, ~2.4s worst case); the
+  //    GHL update path self-heals if the ID is reassigned later.
+  const viaSearch = await resolveCreatedClientId(client, input, 3, 800);
+  if (viaSearch) {
+    if (viaSearch !== returnedId) {
+      console.log("mindbody addclient Id corrected via search", {
+        siteId,
+        returnedId: returnedId || null,
+        resolvedId: viaSearch,
+      });
+    }
+    return { ...created, Id: viaSearch };
   }
 
-  const resolved = await resolveCreatedClientId(client, input);
-  if (resolved) {
-    console.log("mindbody addclient Id corrected via search", {
-      siteId,
-      returnedId: returnedId || null,
-      resolvedId: resolved,
-    });
-    return { ...created, Id: resolved };
+  // 2. Search hasn't indexed it yet. Ask clientcompleteinfo by the returned Id
+  //    and trust the Id it reports back (it may differ from what we sent).
+  if (returnedId) {
+    const reported = await reportedClientId(client, returnedId);
+    if (reported) {
+      if (reported !== returnedId) {
+        console.log("mindbody addclient Id corrected via clientcompleteinfo", {
+          siteId,
+          returnedId,
+          resolvedId: reported,
+        });
+      }
+      return { ...created, Id: reported };
+    }
   }
 
-  // Could not verify or resolve. Return what we have so the caller still gets a
-  // response, but flag it loudly — this Id may not be usable for updates.
+  // 3. Could not verify or resolve. Return what we have so the caller still gets
+  //    a response, but flag it loudly — this Id may not be usable for updates.
   console.log("mindbody addclient Id UNVERIFIED (updates may fail)", {
     siteId,
     returnedId: returnedId || null,
