@@ -156,17 +156,46 @@ export async function resolveClientForEsign(
   throw Object.assign(new Error(`${matches.length} Mindbody clients share this phone`), { code: "client_ambiguous" });
 }
 
-/** Upload a file to the client's Documents tab (POST /client/uploadclientdocument). */
+function mbErrorText(e: any) {
+  return String(e?.response?.data?.Error?.Message || e?.response?.data?.Message || e?.message || "");
+}
+
+/**
+ * Upload a file to the client's Documents tab (POST /client/uploadclientdocument).
+ *
+ * Mindbody rejects some sites' uploads with "Media type pdf is invalid" when the
+ * FileName carries no extension, and the accepted MediaType spelling is not
+ * consistent across sites. A rejected upload stores nothing, so on a media type
+ * error we retry the next spelling: name.pdf + "pdf", name.pdf + "application/pdf",
+ * then name + ".pdf" (dotted extension). Any other error is thrown at once.
+ */
 export async function uploadClientDocument(
   siteId: number,
   input: { clientId: string | number; fileName: string; mediaType: string; base64: string }
 ) {
   const client = await mbClient(siteId);
-  const res = await client.post(`/client/uploadclientdocument`, {
-    ClientId: String(input.clientId),
-    File: { FileName: input.fileName, MediaType: input.mediaType, Buffer: input.base64 },
-  });
-  return res.data ?? null;
+  const ext = input.mediaType.replace(/^\./, "").toLowerCase();
+  const base = input.fileName.replace(new RegExp(`\\.${ext}$`, "i"), "");
+  const mime = ext === "pdf" ? "application/pdf" : ext;
+  const variants = [
+    { FileName: `${base}.${ext}`, MediaType: ext },
+    { FileName: `${base}.${ext}`, MediaType: mime },
+    { FileName: base, MediaType: `.${ext}` },
+  ];
+  let lastErr: any;
+  for (const v of variants) {
+    try {
+      const res = await client.post(`/client/uploadclientdocument`, {
+        ClientId: String(input.clientId),
+        File: { ...v, Buffer: input.base64 },
+      });
+      return { data: res.data ?? null, fileName: v.FileName, mediaType: v.MediaType };
+    } catch (e: any) {
+      lastErr = e;
+      if (!/media\s*type|file\s*type|extension/i.test(mbErrorText(e))) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 /**

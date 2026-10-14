@@ -204,8 +204,9 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
       return { status: 200, body };
     }
 
-    await uploadClientDocument(site.siteId, { clientId, fileName, mediaType: "pdf", base64: cert.base64 });
+    const upload = await uploadClientDocument(site.siteId, { clientId, fileName, mediaType: "pdf", base64: cert.base64 });
     body.documentUploaded = true;
+    body.documentMediaType = upload.mediaType;
 
     // Plain log entry (no staff id = not a follow-up task). A failure here does
     // not undo the upload, so it is reported but not treated as a failed write-back.
