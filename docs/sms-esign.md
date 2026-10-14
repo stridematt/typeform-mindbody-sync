@@ -56,14 +56,11 @@ Unlike the sheets webhook, `siteKey` is required here (no HB fallback), so a sig
 
 ### Contact custom fields
 
-Staff fill these (folder "Phone Sale Agreement"):
+Staff fill this (folder "Phone Sale Agreement"):
 
-- ESign Plan Name (dropdown of studio plans)
-- ESign Price (e.g. `$189.00 per month`)
-- ESign Term (e.g. `12 months, billed monthly`)
-- ESign Start Date (date)
-- ESign Renewal (e.g. `Renews month to month after the initial term until cancelled`)
 - ESign Sent By (dropdown of staff names)
+
+The certificate sets the membership terms itself: Term is `Month to month, 30 day cancellation notice required` (override with `ESIGN_TERM`), Start date is the signing day in studio time, and Renewal date is the same day the next month (clamped to month end). Plan and price are not printed. Plan, price, term, start date and renewal values sent in the body are ignored. GHL's Customer Replied trigger has no message id merge field, so the Message ID row only appears when one is supplied.
 
 Written by the workflows (single-line text, read-only for staff):
 
@@ -80,7 +77,7 @@ Check each field's merge key in the picker after creating it; the bodies below a
 ### Staff process (on the phone)
 
 1. Open the member's contact (do not create a new one; same rule as the IG leads).
-2. Fill the six Phone Sale Agreement fields.
+2. Set ESign Sent By.
 3. Add tag `esign-send` and tell the member: "I just texted you your membership terms. Please reply AGREE to sign."
 4. Stay on the line until the confirmation text lands. If the window passes, remove and re-add `esign-send` to send the terms again.
 
