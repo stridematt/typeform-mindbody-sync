@@ -21,7 +21,7 @@ Friend reply -------> GHL Workflow 3 --> notify studio staff
 |---|---|
 | `app/api/esign/route.ts` | `action: start` opens a signature request; `action: verify` checks the reply and writes to Mindbody |
 | `lib/esign.ts` | Reply rules, reply modes, certificate PDF (pdf-lib) |
-| `lib/mindbody.ts` | Adds `resolveClientForEsign` and `uploadClientDocument`; reuses the existing token cache, `searchClients`, phone and name matching, and `addContactLog` |
+| `lib/esign-mindbody.ts` | Mindbody calls for e-sign only: client lookup by replying phone, document upload, contact log. Separate from `lib/mindbody.ts` so no existing integration is affected; same env vars and auth |
 
 ## Vercel env
 

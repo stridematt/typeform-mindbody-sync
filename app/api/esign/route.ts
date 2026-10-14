@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
-import { resolveClientForEsign, uploadClientDocument, addContactLog } from "../../../lib/mindbody";
+import { resolveClientForEsign, uploadClientDocument, addEsignContactLog } from "../../../lib/esign-mindbody";
 import {
   DEFAULT_TTL_MINUTES,
   buildCertificatePdf,
@@ -209,7 +209,7 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
     try {
       const plan = str(p.planName) ? ` for ${str(p.planName)}` : "";
       const terms = [str(p.termsVersion), str(p.termsUrl)].filter(Boolean).join(" ");
-      await addContactLog(site.siteId, {
+      await addEsignContactLog(site.siteId, {
         clientId,
         text:
           `Membership terms e-signed via SMS${plan}.` +
