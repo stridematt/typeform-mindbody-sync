@@ -115,7 +115,10 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
     return { status: 200, body: { ok: true, result: "already_signed", esignStatus: "signed" } };
   }
   const mode = replyModeFromEnv();
-  const required = mode === "code" ? ["siteKey", "phone", "esignCode", "esignExpiresAt"] : ["siteKey", "phone", "esignExpiresAt"];
+  // A missing expiry (contact never got a terms text, or fields were cleared) is
+  // not a bad request: evaluateReply treats it as "expired", so GHL gets a 200 it
+  // can branch on. This also lets GHL's webhook test run against any contact.
+  const required = mode === "code" ? ["siteKey", "phone", "esignCode"] : ["siteKey", "phone"];
   for (const f of required) {
     if (!str(p[f])) return { status: 400, body: { ok: false, error: `${f} is required` } };
   }
