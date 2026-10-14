@@ -7,6 +7,7 @@ import {
   evaluateReply,
   generateCode,
   generateRequestId,
+  replyModeFromEnv,
   type EsignResult,
 } from "../../../lib/esign";
 
@@ -17,9 +18,11 @@ export const maxDuration = 30;
  * CHANGE LOG (2026-10-14): SMS e-sign for phone membership sales.
  *
  *   Called by two GHL Webhook actions (flat JSON, header x-esign-secret):
- *     { action: "start" }   -> issues a 6-digit code + expiry for GHL to text
- *                              the member with the terms link.
- *     { action: "verify" }  -> checks the member's reply ("AGREE 482913").
+ *     { action: "start" }   -> issues a request id + expiry (and, in code mode,
+ *                              a 6-digit code) for GHL to text the member with
+ *                              the terms link.
+ *     { action: "verify" }  -> checks the member's reply ("AGREE", or in code
+ *                              mode "AGREE 482913").
  *                              When it checks out: builds the Membership Terms
  *                              Acceptance PDF, uploads it to the client's
  *                              Mindbody Documents, adds a contact log entry.
@@ -33,7 +36,9 @@ export const maxDuration = 30;
  *   nothing to Mindbody, returning certificateBase64 instead.
  *
  *   Env: ESIGN_WEBHOOK_SECRET (required), MINDBODY_SITE_ID_{KEY} (existing),
- *   ESIGN_CODE_TTL_MINUTES (15), ESIGN_REQUIRE_AGREE ("true"),
+ *   ESIGN_REPLY_MODE ("agree_only" | "code", default agree_only),
+ *   ESIGN_CODE_TTL_MINUTES (15, the reply window in both modes),
+ *   ESIGN_REQUIRE_AGREE ("true", code mode only),
  *   ESIGN_TIMEZONE ("America/Los_Angeles"), ESIGN_CONTACT_METHOD ("Text Message").
  */
 
@@ -88,12 +93,14 @@ function last4(phone: string) {
 function handleStart(p: Record<string, unknown>, now = new Date()) {
   if (!str(p.phone)) return { status: 400, body: { ok: false, error: "phone is required" } };
   const ttl = Number(process.env.ESIGN_CODE_TTL_MINUTES) || DEFAULT_TTL_MINUTES;
+  const mode = replyModeFromEnv();
   return {
     status: 200,
     body: {
       ok: true,
       esignStatus: "pending",
-      esignCode: generateCode(),
+      esignReplyMode: mode,
+      esignCode: mode === "code" ? generateCode() : "",
       esignExpiresAt: new Date(now.getTime() + ttl * 60_000).toISOString(),
       esignCodeSentAt: now.toISOString(),
       esignRequestId: generateRequestId(now),
@@ -107,13 +114,16 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
   if (str(p.esignStatus).toLowerCase() === "signed") {
     return { status: 200, body: { ok: true, result: "already_signed", esignStatus: "signed" } };
   }
-  for (const f of ["siteKey", "phone", "esignCode", "esignExpiresAt"]) {
+  const mode = replyModeFromEnv();
+  const required = mode === "code" ? ["siteKey", "phone", "esignCode", "esignExpiresAt"] : ["siteKey", "phone", "esignExpiresAt"];
+  for (const f of required) {
     if (!str(p[f])) return { status: 400, body: { ok: false, error: `${f} is required` } };
   }
 
   const requireAgree = str(process.env.ESIGN_REQUIRE_AGREE || "true").toLowerCase() !== "false";
   const outcome = evaluateReply({
     replyText: p.replyText,
+    mode,
     expectedCode: str(p.esignCode),
     expiresAt: str(p.esignExpiresAt),
     attempts: p.esignAttempts,
@@ -173,6 +183,7 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
         replyAt: signedAt,
         messageId: str(p.messageId),
         staffName: str(p.staffName),
+        replyMode: mode,
         requireAgree,
       },
       process.env.ESIGN_TIMEZONE || "America/Los_Angeles"

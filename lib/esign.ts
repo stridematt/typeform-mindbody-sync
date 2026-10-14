@@ -20,12 +20,13 @@ export function generateRequestId(now = new Date()) {
 }
 
 /**
- * Accepts "AGREE 482913", "agree482913", "I agree 482 913", "Agreed 482913".
- * "DISAGREE" never counts as AGREE.
+ * Accepts "AGREE", "I agree", "Agreed!", "AGREE 482913", "agree482913".
+ * Never counts "DISAGREE", "I don't agree", "do not agree", "not agree".
  */
 export function parseReply(text: unknown) {
-  const upper = String(text ?? "").toUpperCase();
-  const hasAgree = /(^|[^A-Z])AGREED?(?![A-Z])/.test(upper);
+  const upper = String(text ?? "").toUpperCase().replace(/[\u2018\u2019]/g, "'");
+  const negated = /(^|[^A-Z])(NOT|DON'?T|DO NOT|NEVER|CAN'?T|CANNOT)\s+(YET\s+)?AGREE/.test(upper);
+  const hasAgree = !negated && /(^|[^A-Z])AGREED?(?![A-Z])/.test(upper);
   const compact = upper.replace(/(\d)[\s-]+(?=\d)/g, "$1");
   const codes = compact.match(/\d{6}/g) ?? [];
   return { hasAgree, codes };
@@ -39,9 +40,20 @@ function safeEqual(a: string, b: string) {
 
 export type EsignResult = "signed" | "wrong_code" | "need_agree" | "need_code" | "unrecognized" | "expired" | "locked";
 
+/**
+ * agree_only: the reply "AGREE" from the contact's phone, inside the window, signs.
+ * code:       the reply must carry the one-time code (and AGREE unless requireAgree=false).
+ */
+export type ReplyMode = "agree_only" | "code";
+
+export function replyModeFromEnv(): ReplyMode {
+  return String(process.env.ESIGN_REPLY_MODE || "agree_only").trim().toLowerCase() === "code" ? "code" : "agree_only";
+}
+
 export function evaluateReply(input: {
   replyText: unknown;
-  expectedCode: string;
+  mode?: ReplyMode;
+  expectedCode?: string;
   expiresAt: string;
   attempts?: unknown;
   requireAgree?: boolean;
@@ -55,10 +67,16 @@ export function evaluateReply(input: {
   if (!Number.isFinite(exp) || now.getTime() > exp) return { result: "expired", attempts: prior };
 
   const { hasAgree, codes } = parseReply(input.replyText);
+
+  if ((input.mode ?? "agree_only") === "agree_only") {
+    // No code to get wrong, so attempts never climb; anything but AGREE goes to staff.
+    return { result: hasAgree ? "signed" : "unrecognized", attempts: prior };
+  }
+
   // Ordinary chatter ("what is this?") does not burn an attempt.
   if (codes.length === 0) return { result: hasAgree ? "need_code" : "unrecognized", attempts: prior };
 
-  if (!codes.some((c) => safeEqual(c, input.expectedCode))) {
+  if (!input.expectedCode || !codes.some((c) => safeEqual(c, input.expectedCode!))) {
     const next = prior + 1;
     return { result: next >= MAX_ATTEMPTS ? "locked" : "wrong_code", attempts: next };
   }
@@ -90,6 +108,7 @@ export type CertificateInput = {
   replyAt: string;
   messageId: string;
   staffName: string;
+  replyMode: ReplyMode;
   requireAgree: boolean;
 };
 
@@ -150,6 +169,7 @@ export function buildEvidence(p: CertificateInput) {
     replyReceivedAt: clean(p.replyAt),
     replyMessageId: clean(p.messageId),
     staffName: clean(p.staffName),
+    replyMode: p.replyMode,
   };
 }
 
@@ -199,14 +219,18 @@ export async function buildCertificatePdf(p: CertificateInput, timeZone = "Ameri
   y -= 30;
   page.drawText("Membership Terms Acceptance", { x: M, y, size: 20, font: bold, color: INK });
   y -= 18;
-  page.drawText("Electronic signature by SMS reply with one-time code", { x: M, y, size: 10.5, font: reg, color: MUTED });
+  page.drawText(p.replyMode === "agree_only" ? "Electronic signature by SMS reply" : "Electronic signature by SMS reply with one-time code", { x: M, y, size: 10.5, font: reg, color: MUTED });
   y -= 22;
 
+  const how =
+    p.replyMode === "agree_only"
+      ? `by replying AGREE from the mobile number ${evidence.memberPhone} to the text that sent them the terms link. `
+      : `by replying from the mobile number ${evidence.memberPhone} with the one-time code sent to that number` +
+        (p.requireAgree ? " and the word AGREE. " : ". ");
   const statement =
-    `${evidence.memberName || "The member"} accepted the STRIDE Fitness membership terms identified below by replying from ` +
-    `the mobile number ${evidence.memberPhone} with the one-time code sent to that number` +
-    (p.requireAgree ? " and the word AGREE. " : ". ") +
-    "The reply was received within the code validity window and is recorded below as the member's electronic signature.";
+    `${evidence.memberName || "The member"} accepted the STRIDE Fitness membership terms identified below ` +
+    how +
+    "The reply was received within the validity window and is recorded below as the member's electronic signature.";
   for (const l of wrap(statement, reg, 10.5, W)) { page.drawText(l, { x: M, y, size: 10.5, font: reg, color: INK }); y -= 15; }
   y -= 8;
 
@@ -244,7 +268,7 @@ export async function buildCertificatePdf(p: CertificateInput, timeZone = "Ameri
   row("Terms version", evidence.termsVersion);
 
   section("Signature event");
-  row("Code sent", fmtTime(p.codeSentAt, timeZone));
+  row(p.replyMode === "agree_only" ? "Terms text sent" : "Code sent", fmtTime(p.codeSentAt, timeZone));
   row("Reply received", fmtTime(p.replyAt, timeZone));
   row("Reply text", `"${evidence.replyText}"`);
   row("Message ID", evidence.replyMessageId);
