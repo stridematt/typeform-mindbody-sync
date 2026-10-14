@@ -655,3 +655,86 @@ export async function listProspectStages(siteId: number) {
   // Mindbody returns { ProspectStages: [...] }
   return res.data?.ProspectStages ?? [];
 }
+
+/* ---------- SMS e-sign support (added 2026-10-14) ---------- */
+
+/**
+ * Resolve the addressable Client ID for the member who just signed by SMS reply.
+ *
+ * The replying phone is the proof of identity here, so every path requires the
+ * client's phone (mobile, home or work, last-10) to match it:
+ *   1. The Mindbody ID stored on the GHL contact, read via clientcompleteinfo
+ *      (accepts either Id form) and re-read off the returned record, so a
+ *      pre-reassignment internal number still resolves to the addressable Id.
+ *   2. Otherwise a phone search. One phone match wins. Several (shared household
+ *      number) are narrowed by real email, then by name agreement. Still several
+ *      -> ambiguous, and nothing is written.
+ */
+export async function resolveClientForEsign(
+  siteId: number,
+  input: { mbClientId?: string; phone: string; email?: string; firstName?: string; lastName?: string }
+): Promise<{ clientId: string; via: "id" | "phone" }> {
+  const client = await mbClient(siteId);
+  const phoneCanon = last10(input.phone);
+  if (!phoneCanon) {
+    throw Object.assign(new Error("No 10-digit phone to match the Mindbody client"), { code: "no_phone" });
+  }
+  const phoneMatchesClient = (c: any) =>
+    [c?.MobilePhone, c?.HomePhone, c?.WorkPhone]
+      .filter(Boolean)
+      .some((p: string) => phonesMatch(p, phoneCanon));
+
+  const storedId = String(input.mbClientId ?? "").trim();
+  if (storedId) {
+    try {
+      const res = await client.get(`/client/clientcompleteinfo`, { params: { ClientId: storedId } });
+      const c = res.data?.Client ?? res.data;
+      if (c?.Id != null && phoneMatchesClient(c)) {
+        return { clientId: String(c.Id).trim(), via: "id" };
+      }
+    } catch {
+      // fall through to phone search
+    }
+  }
+
+  const rows = await searchClients(client, phoneCanon);
+  let matches = rows.filter(phoneMatchesClient);
+
+  if (matches.length > 1) {
+    const emailLower = (input.email ?? "").trim().toLowerCase();
+    if (emailLower.includes("@") && !isFallbackEmail(emailLower)) {
+      const byEmail = matches.filter((c) => String(c?.Email || "").trim().toLowerCase() === emailLower);
+      if (byEmail.length >= 1) matches = byEmail;
+    }
+  }
+  if (matches.length > 1 && input.firstName && input.lastName) {
+    const byName = matches.filter((c) =>
+      namesAgree(input.firstName!, input.lastName!, String(c?.FirstName || ""), String(c?.LastName || ""))
+    );
+    if (byName.length >= 1) matches = byName;
+  }
+
+  if (matches.length === 1 && matches[0]?.Id != null) {
+    return { clientId: String(matches[0].Id), via: "phone" };
+  }
+  if (matches.length === 0) {
+    throw Object.assign(new Error("No Mindbody client matches this phone"), { code: "client_not_found" });
+  }
+  throw Object.assign(new Error(`${matches.length} Mindbody clients share this phone`), { code: "client_ambiguous" });
+}
+
+/**
+ * Upload a file to the client's Documents tab (POST /client/uploadclientdocument).
+ * MediaType is the bare extension (e.g. "pdf"); Buffer is the base64 file bytes.
+ */
+export async function uploadClientDocument(
+  siteId: number,
+  input: { clientId: string | number; fileName: string; mediaType: string; base64: string }
+) {
+  const client = await mbClient(siteId);
+  const res = await client.post(`/client/uploadclientdocument`, {
+    ClientId: String(input.clientId),
+    File: { FileName: input.fileName, MediaType: input.mediaType, Buffer: input.base64 },
+  });
+  return res.data ?? null;
+}
