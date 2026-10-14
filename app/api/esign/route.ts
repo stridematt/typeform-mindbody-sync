@@ -78,8 +78,10 @@ function resolveSiteId(siteKey: unknown): { ok: true; siteId: number } | { ok: f
   return { ok: true, siteId: parsed };
 }
 
+// GHL sends the literal text "null" for an empty merge field.
 function str(v: unknown) {
-  return v == null ? "" : String(v).trim();
+  const t = v == null ? "" : String(v).trim();
+  return /^(null|undefined)$/i.test(t) ? "" : t;
 }
 
 function errMessage(e: any) {
@@ -211,12 +213,11 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
     // Plain log entry (no staff id = not a follow-up task). A failure here does
     // not undo the upload, so it is reported but not treated as a failed write-back.
     try {
-      const plan = str(p.planName) ? ` for ${str(p.planName)}` : "";
       const terms = [str(p.termsVersion), str(p.termsUrl)].filter(Boolean).join(" ");
       await addEsignContactLog(site.siteId, {
         clientId,
         text:
-          `Membership terms e-signed via SMS${plan}.` +
+          "Membership terms e-signed via SMS (month to month, 30 day cancellation notice)." +
           (terms ? ` Terms ${terms}.` : "") +
           ` Reply from phone ending ${last4(str(p.phone))}. Record ${requestId}, certificate in Documents.`,
         contactMethod: process.env.ESIGN_CONTACT_METHOD || "Text Message",

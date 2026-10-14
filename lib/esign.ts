@@ -126,7 +126,37 @@ export function clean(value: unknown) {
     .replace(/\u2026/g, "...")
     .normalize("NFKD")
     .replace(/[^\x20-\x7E]/g, "")
-    .trim();
+    .trim()
+    // GHL sends the literal text "null" for an empty merge field.
+    .replace(/^(null|undefined)$/i, "");
+}
+
+export const DEFAULT_TERM = "Month to month, 30 day cancellation notice required";
+
+/** Calendar date (YYYY-MM-DD) of an instant in the studio's time zone. */
+function localYmd(iso: string, timeZone: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(d);
+  const get = (t: string) => Number(parts.find((x) => x.type === t)?.value);
+  return { y: get("year"), m: get("month"), d: get("day") };
+}
+
+function fmtYmd(y: number, m: number, d: number) {
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-US", { timeZone: "UTC", year: "numeric", month: "short", day: "numeric" });
+}
+
+/**
+ * Start date = the day the record is signed (studio time). Renewal = the same day
+ * next month, clamped to the last day of a shorter month (Jan 31 -> Feb 28).
+ */
+export function membershipDates(signedAtIso: string, timeZone: string) {
+  const s = localYmd(signedAtIso, timeZone);
+  if (!s) return { startDate: "", renewalDate: "" };
+  const ny = s.m === 12 ? s.y + 1 : s.y;
+  const nm = s.m === 12 ? 1 : s.m + 1;
+  const lastDay = new Date(Date.UTC(ny, nm, 0)).getUTCDate();
+  return { startDate: fmtYmd(s.y, s.m, s.d), renewalDate: fmtYmd(ny, nm, Math.min(s.d, lastDay)) };
 }
 
 export function formatPhone(phone: string) {
@@ -147,7 +177,8 @@ function fmtTime(iso: string, timeZone: string) {
 }
 
 /** Canonical record; its SHA-256 is printed on the PDF and returned to GHL. */
-export function buildEvidence(p: CertificateInput) {
+export function buildEvidence(p: CertificateInput, timeZone = "America/Los_Angeles") {
+  const dates = membershipDates(p.replyAt, timeZone);
   return {
     requestId: clean(p.requestId),
     studio: clean(p.studioName),
@@ -157,11 +188,10 @@ export function buildEvidence(p: CertificateInput) {
     memberName: clean(`${p.firstName} ${p.lastName}`),
     memberEmail: clean(p.email),
     memberPhone: formatPhone(p.phone),
-    plan: clean(p.planName),
-    price: clean(p.price),
-    term: clean(p.term),
-    startDate: clean(p.startDate),
-    renewal: clean(p.renewal),
+    // Fixed for every phone sale; GHL's term field is no longer used.
+    term: clean(process.env.ESIGN_TERM) || DEFAULT_TERM,
+    startDate: dates.startDate,
+    renewalDate: dates.renewalDate,
     termsUrl: clean(p.termsUrl),
     termsVersion: clean(p.termsVersion),
     codeSentAt: clean(p.codeSentAt),
@@ -195,7 +225,7 @@ function wrap(text: string, font: PDFFont, size: number, maxWidth: number) {
 }
 
 export async function buildCertificatePdf(p: CertificateInput, timeZone = "America/Los_Angeles") {
-  const evidence = buildEvidence(p);
+  const evidence = buildEvidence(p, timeZone);
   const sha256 = crypto.createHash("sha256").update(JSON.stringify(evidence)).digest("hex");
 
   const pdf = await PDFDocument.create();
@@ -259,11 +289,9 @@ export async function buildCertificatePdf(p: CertificateInput, timeZone = "Ameri
   row("Studio", evidence.studio);
 
   section("Membership");
-  row("Plan", evidence.plan);
-  row("Price", evidence.price);
   row("Term", evidence.term);
   row("Start date", evidence.startDate);
-  row("Renewal", evidence.renewal);
+  row("Renewal date", evidence.renewalDate);
   row("Terms link", evidence.termsUrl);
   row("Terms version", evidence.termsVersion);
 
@@ -271,7 +299,9 @@ export async function buildCertificatePdf(p: CertificateInput, timeZone = "Ameri
   row(p.replyMode === "agree_only" ? "Terms text sent" : "Code sent", fmtTime(p.codeSentAt, timeZone));
   row("Reply received", fmtTime(p.replyAt, timeZone));
   row("Reply text", `"${evidence.replyText}"`);
-  row("Message ID", evidence.replyMessageId);
+  // GHL's Customer Replied trigger exposes no message id, so the row only
+  // appears when a caller supplies one.
+  if (evidence.replyMessageId) row("Message ID", evidence.replyMessageId);
   row("Sent by staff", evidence.staffName);
   row("GHL contact ID", evidence.ghlContactId);
 
