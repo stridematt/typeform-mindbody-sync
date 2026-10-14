@@ -233,16 +233,38 @@ async function handleVerify(p: Record<string, unknown>, now = new Date()) {
   }
 }
 
+/**
+ * GHL pastes {{message.body}} into the JSON body without escaping, so a reply
+ * containing a double quote or a line break breaks the JSON. replyText is the
+ * last field in the verify body, so when a normal parse fails we take everything
+ * between `"replyText": "` and the final `"` before the closing brace as the raw
+ * reply, re-encode it, and parse again.
+ */
+function parseGhlBody(raw: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(raw) ?? {};
+  } catch {
+    const key = /"replyText"\s*:\s*"/.exec(raw);
+    const end = raw.lastIndexOf("}");
+    if (!key || end < 0) return null;
+    const start = key.index + key[0].length;
+    const close = raw.lastIndexOf('"', end);
+    if (close < start) return null;
+    const repaired = raw.slice(0, start - 1) + JSON.stringify(raw.slice(start, close)) + raw.slice(close + 1);
+    try {
+      return JSON.parse(repaired) ?? {};
+    } catch {
+      return null;
+    }
+  }
+}
+
 export async function POST(req: Request) {
   const auth = verifySecret(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.reason }, { status: 401 });
 
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await req.json()) ?? {};
-  } catch {
-    return NextResponse.json({ ok: false, error: "Body must be JSON" }, { status: 400 });
-  }
+  const payload = parseGhlBody(await req.text());
+  if (!payload) return NextResponse.json({ ok: false, error: "Body must be JSON" }, { status: 400 });
 
   const action = str(payload.action).toLowerCase();
   let out: { status: number; body: Record<string, unknown> };
